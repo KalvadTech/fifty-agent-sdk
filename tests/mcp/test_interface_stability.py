@@ -19,18 +19,32 @@ from fifty_agent_sdk.tools.mcp_provider import MCPProvider, RefreshSummary
 
 def test_top_level_exports_present() -> None:
     """``fifty_agent_sdk.__all__`` still exports the MCP public surface."""
-    for name in ("MCPClient", "MCPClientConfig", "MCPToolDef", "MCPProvider", "RefreshSummary"):
+    for name in (
+        "MCPClient",
+        "MCPClientConfig",
+        "MCPToolDef",
+        "MCPToolErrorHook",
+        "MCPProvider",
+        "RefreshSummary",
+    ):
         assert name in fifty_agent_sdk.__all__, f"{name} missing from fifty_agent_sdk.__all__"
         assert getattr(fifty_agent_sdk, name) is not None
 
 
 def test_mcpclient_signatures_stable() -> None:
-    """``MCPClient`` keeps its method signatures."""
+    """``MCPClient`` keeps its method signatures.
+
+    ``on_tool_error`` was APPENDED as a keyword-only, default-``None`` parameter
+    in BR-010 — additive public surface, so every prior construction site is
+    unchanged.
+    """
     init_sig = inspect.signature(MCPClient.__init__)
     params = init_sig.parameters
-    assert list(params) == ["self", "config", "auth", "client"]
+    assert list(params) == ["self", "config", "auth", "client", "on_tool_error"]
     assert params["auth"].kind is inspect.Parameter.KEYWORD_ONLY
     assert params["client"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["on_tool_error"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["on_tool_error"].default is None
 
     assert inspect.iscoroutinefunction(MCPClient.discover)
     assert inspect.iscoroutinefunction(MCPClient.invoke)

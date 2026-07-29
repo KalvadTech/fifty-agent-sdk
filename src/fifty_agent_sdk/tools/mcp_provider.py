@@ -145,6 +145,17 @@ class _MCPToolAdapter:
         (registry.py), giving the surrounding runner the chance to surface a
         genuine connection failure as a system error rather than masking a dead
         connection as a recoverable per-tool failure.
+
+    Error-message transformation (BR-010):
+        When the underlying client was constructed with
+        ``MCPClient(..., on_tool_error=...)``, the ``message`` this adapter
+        receives has ALREADY been screened/redacted/reshaped by that hook — the
+        transformation happens inside :meth:`MCPClient.invoke`, before the
+        carrier reaches here, so the adapter needs no code to support it. The
+        adapter's own rule is unchanged: only ``message`` is surfaced to the
+        model, and ``content`` never is. The hook cannot affect ``is_error`` or
+        ``output``, so the recoverable/fatal mapping below is exactly what it
+        was pre-BR-010, and the hook-off path is byte-for-byte identical.
     """
 
     def __init__(self, defn: MCPToolDef, client: MCPClient) -> None:
@@ -164,6 +175,12 @@ class _MCPToolAdapter:
         deliberately kept OFF the model-facing ``error`` string — only the
         bounded message reaches the model, mirroring the security caution on
         :meth:`MCPClient._unwrap_invoke_result`.
+
+        That ``message`` may already have been transformed by the client's
+        ``on_tool_error`` hook (BR-010) — the hook runs inside
+        :meth:`MCPClient.invoke` and can only replace the message string, so
+        this mapping is unchanged either way: a transformed message still
+        produces ``ToolResult(output=None, is_error=True, error=<message>)``.
 
         On success returns ``ToolResult(output=..., is_error=False)``.
 

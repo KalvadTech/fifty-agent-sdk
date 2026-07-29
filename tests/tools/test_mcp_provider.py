@@ -179,6 +179,65 @@ async def test_registry_invoke_maps_is_error_to_tool_result(
     assert "missing" in (result.error or "")
 
 
+async def test_on_tool_error_replacement_reaches_tool_result_error(
+    controllable_server: ControllableServer,
+) -> None:
+    """The screened string is what a consumer reads off ``ToolResult.error`` (BR-010).
+
+    End-to-end through ``MCPProvider`` + ``Registry.invoke``, and — the point of
+    the brief — reachable by PLAIN CONSTRUCTION: an ``MCPClient`` built with
+    ``on_tool_error=`` handed to ``MCPProvider(client)``. Nothing here subclasses
+    ``MCPClient`` or ``_MCPToolAdapter``, and nothing imports a private symbol to
+    make the seam work.
+    """
+    seen: list[tuple[str, list[dict[str, Any]]]] = []
+
+    def screen(message: str, content: list[dict[str, Any]]) -> str:
+        seen.append((message, content))
+        return "the upstream tool is unavailable"
+
+    controllable_server.set_tool_catalog([_tool_def("missing")])
+    client = make_controllable_client(controllable_server, on_tool_error=screen)
+    provider = MCPProvider(client)
+    registry = Registry()
+    await provider.attach(registry)
+
+    result = await registry.invoke("missing", {}, timeout=1.0)
+    assert isinstance(result, ToolResult)
+    assert result.error == "the upstream tool is unavailable"
+    # The hook saw the SDK's bounded default plus the server's raw content.
+    assert len(seen) == 1
+    assert "missing" in seen[0][0]
+    assert isinstance(seen[0][1], list)
+
+
+async def test_on_tool_error_replacement_still_yields_is_error_true_and_no_output(
+    controllable_server: ControllableServer,
+) -> None:
+    """A hook cannot confabulate success: ``is_error`` and ``output`` are untouchable.
+
+    Learning #886's anti-confabulation guarantee under BR-010 — whatever the
+    screen returns, a failed tool is still reported as ``output=None,
+    is_error=True``.
+    """
+    controllable_server.set_tool_catalog([_tool_def("missing")])
+    client = make_controllable_client(
+        controllable_server,
+        on_tool_error=lambda message, content: "everything is fine, nothing failed",
+    )
+    provider = MCPProvider(client)
+    registry = Registry()
+    await provider.attach(registry)
+
+    adapter_result = await registry.get("missing").invoke({})
+    registry_result = await registry.invoke("missing", {}, timeout=1.0)
+    for result in (adapter_result, registry_result):
+        assert isinstance(result, ToolResult)
+        assert result.output is None
+        assert result.is_error is True
+        assert result.error == "everything is fine, nothing failed"
+
+
 async def test_mcp_transport_error_still_raises() -> None:
     """A transport/connection failure STILL raises MCPError (fatal path).
 
@@ -209,6 +268,47 @@ async def test_mcp_transport_error_still_raises() -> None:
     registry.register(adapter)
     with pytest.raises(MCPError):
         await registry.invoke("search", {"q": "x"}, timeout=1.0)
+
+
+async def test_mcp_transport_error_still_raises_with_error_hook_configured() -> None:
+    """The BR-005 fatal guardrail holds with a BR-010 screen wired in.
+
+    Same ``httpx.ConnectError`` scenario as the test above, but the client is
+    constructed with ``on_tool_error=``. The failure must STILL raise
+    :class:`MCPError` through BOTH the adapter and the registry, and the screen
+    must never be called: the hook is applied strictly inside ``invoke``'s
+    per-call-error branch, which a transport failure never reaches. This is the
+    guardrail extended to cover the new seam — a screen can never downgrade a
+    dead connection into a recoverable observation.
+    """
+    calls: list[tuple[str, list[dict[str, Any]]]] = []
+
+    def screen(message: str, content: list[dict[str, Any]]) -> str:
+        calls.append((message, content))
+        return "should never be used"
+
+    def boom(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("nope")
+
+    http_client, _ = make_strict_http_client(boom)
+    client = MCPClient(
+        MCPClientConfig(base_url=MCP_URL),
+        client=http_client,
+        on_tool_error=screen,
+    )
+    defn = MCPToolDef(name="search", description="search", input_schema={})
+    adapter = _MCPToolAdapter(defn, client)
+
+    with pytest.raises(MCPError) as exc:
+        await adapter.invoke({"q": "x"})
+    assert exc.value.context["wrapped"] == "ConnectError"
+
+    registry = Registry()
+    registry.register(adapter)
+    with pytest.raises(MCPError):
+        await registry.invoke("search", {"q": "x"}, timeout=1.0)
+
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------

@@ -58,13 +58,34 @@ Error contract
     NOT catch :class:`MCPError` so the
     :class:`fifty_agent_sdk.tools.registry.Registry`'s ``AgentSdkError`` branch
     re-raises it untouched.
+
+Error-content transformation seam (BR-010)
+    An MCP server's ``isError`` payload is upstream-controlled prose. A
+    consumer running against an untrusted or semi-trusted server needs to
+    screen, redact, or reshape that text *before* it reaches the model. The
+    supported, public seam is the keyword-only ``on_tool_error`` callback on
+    :class:`MCPClient` — see :data:`MCPToolErrorHook` and the ``Args:`` entry on
+    :class:`MCPClient`. It fires ONLY on a per-call ``isError=True`` outcome
+    (never on success, and structurally never on a transport/protocol/session
+    failure, which raises :class:`MCPError` at the ``call_tool`` boundary
+    *before* the unwrap), and it can change only the bounded ``message``
+    string — never ``is_error``, never ``output``, never the recoverable/fatal
+    classification. Leaving it unset (the default) is byte-for-byte the
+    pre-BR-010 behaviour: the ``None`` check short-circuits before the hook is
+    called, inspected, or any new carrier is constructed.
+
+    Reaching into the private :class:`_MCPCallError` / overriding
+    :meth:`MCPClient._unwrap_invoke_result` is NOT supported; those symbols
+    carry no semver protection. Use ``on_tool_error``.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, TypeAlias
 
 import httpx
 import structlog
@@ -266,6 +287,33 @@ AuthHeaders = Mapping[str, str]
 AuthCallable = Callable[[], Awaitable[AuthHeaders]]
 AuthSpec = AuthHeaders | AuthCallable | None
 
+MCPToolErrorHook: TypeAlias = Callable[[str, list[dict[str, Any]]], str | Awaitable[str]]
+"""Public type of the :class:`MCPClient` ``on_tool_error`` callback (BR-010).
+
+Called positionally as ``hook(message, content)`` exactly once per per-call
+``tools/call`` ``isError=True`` outcome, and never on any other path:
+
+* ``message`` — the SDK's bounded, model-safe default
+  (``"MCP tool '<name>' returned isError=True"``).
+* ``content`` — the server's raw error content blocks, verbatim, as the SAME
+  list object retained on the internal per-call error carrier. It MUST be
+  treated as READ-ONLY; the SDK does not copy it (a shallow copy would be a
+  misleading half-guarantee since nested dicts stay shared, and a deep copy is
+  unwarranted cost on an error path).
+
+The return value replaces ``message`` and is surfaced to the model VERBATIM as
+:attr:`fifty_agent_sdk.tools.protocol.ToolResult.error`; the SDK does not
+truncate it, so bounding is the consumer's responsibility.
+
+Sync or async: the hook is called once and its RETURN VALUE is inspected with
+:func:`inspect.isawaitable` — an awaitable is awaited, a plain value is not.
+``async def``, plain ``def``, callable classes and :func:`functools.partial`
+all work (the same "inspect the result, not the function" rule as
+:func:`fifty_agent_sdk.observability.hooks.invoke_hook`).
+
+See :class:`MCPClient` for the full failure policy.
+"""
+
 
 class MCPClient:
     """MCP client for a server over Streamable HTTP, wrapping the ``mcp`` SDK.
@@ -300,6 +348,56 @@ class MCPClient:
             client OWNS the lifecycle of internally-created clients and
             disposes them on :meth:`aclose`, but does NOT close
             externally-provided ones.
+        on_tool_error: Optional :data:`MCPToolErrorHook` — the public seam for
+            transforming a per-call ``isError=True`` message before it reaches
+            the model (BR-010). Called positionally as
+            ``on_tool_error(message, content)`` exactly once per ``isError``
+            result, with the SDK's bounded default ``message`` AND the server's
+            raw ``content`` blocks; its returned ``str`` replaces the message
+            the :class:`fifty_agent_sdk.tools.mcp_provider._MCPToolAdapter`
+            surfaces as ``ToolResult.error``. May be sync or async. The whole
+            wiring is plain construction — ``MCPClient(config,
+            on_tool_error=screen)`` then ``MCPProvider(client)``; no subclassing
+            and no private import is needed or supported.
+
+            **Fires ONLY on the recoverable path.** A transport, protocol, or
+            session failure raises :class:`MCPError` at the ``call_tool``
+            boundary, *before* the result is unwrapped, so the hook is
+            structurally unreachable there (BR-005). It cannot make a fatal
+            error recoverable or vice-versa.
+
+            **What it CANNOT change:** ``is_error`` and ``output``. A replaced
+            message still yields ``ToolResult(output=None, is_error=True,
+            error=<replacement>)`` — a failed tool is never reported as a
+            success.
+
+            **Failure policy — on ANY failure the ORIGINAL bounded message is
+            used.** A raising hook is caught, logged at ``WARNING``
+            (``mcp.tool_error_hook_failed``), and the original per-call error is
+            returned unchanged; the exception never propagates.
+            :class:`asyncio.CancelledError` is the one exception re-raised
+            untouched (consumer cancellation must propagate). A return that is
+            not a ``str``, or a ``str`` that is empty/whitespace-only, is
+            rejected and logged at ``WARNING``
+            (``mcp.tool_error_hook_invalid``). It is structurally impossible for
+            ``ToolResult.error`` to become ``None``, ``""``, or a non-string via
+            this seam. This DIVERGES from
+            :func:`fifty_agent_sdk.observability.hooks.invoke_hook`, which
+            returns ``None`` and merely swallows: this hook must yield a value,
+            so swallowing alone is not a policy.
+
+            **Logging discipline.** The failure logs carry ``tool_name``,
+            ``error_type`` / ``returned_type`` and a ``reason`` ONLY — never
+            ``str(exc)``, never the ``content``, never the message text.
+
+            **Latency.** The hook is awaited INLINE, inside the
+            :class:`fifty_agent_sdk.tools.registry.Registry`'s ``tool_timeout``
+            budget. Keep it fast — a slow screen eats the tool budget. It only
+            ever fires on the error path, so the happy path is untouched.
+
+            **Zero overhead when unset.** The default ``None`` short-circuits
+            before the hook is called, inspected, or any new carrier is
+            constructed; the hook-off path is byte-for-byte the pre-BR-010 path.
     """
 
     def __init__(
@@ -308,6 +406,7 @@ class MCPClient:
         *,
         auth: AuthSpec = None,
         client: httpx.AsyncClient | None = None,
+        on_tool_error: MCPToolErrorHook | None = None,
     ) -> None:
         self._config = config
         self._auth = auth
@@ -319,6 +418,7 @@ class MCPClient:
         )
         self._client = client
         self._owns_client = client is None
+        self._on_tool_error = on_tool_error
         self._closed: bool = False
 
     # ------------------------------------------------------------------
@@ -399,7 +499,11 @@ class MCPClient:
             recoverable per-tool error the
             :class:`fifty_agent_sdk.tools.mcp_provider._MCPToolAdapter` maps to a
             :class:`fifty_agent_sdk.tools.protocol.ToolResult` with
-            ``is_error=True``.
+            ``is_error=True``. When an ``on_tool_error`` hook is configured
+            (BR-010) its returned string replaces that carrier's ``message``
+            (``content`` is preserved unchanged); on any hook failure the
+            original bounded message is used. With no hook configured the
+            carrier is returned by identity, byte-for-byte as before.
 
         Raises:
             MCPError: For transport failure, protocol/handshake failure, or
@@ -440,7 +544,16 @@ class MCPClient:
         except (httpx.HTTPError, BaseExceptionGroup) as exc:
             raise self._mcp_error_from_transport(exc, base_context) from exc
         log.debug("mcp.call_ok")
-        return self._unwrap_invoke_result(result, tool_name=name)
+        unwrapped = self._unwrap_invoke_result(result, tool_name=name)
+        # BR-010: the `on_tool_error` seam fires ONLY inside this branch, which
+        # is reachable only after `call_tool` returned without raising — i.e.
+        # provably a per-call failure. Applying it here (one frame ABOVE the
+        # sync `_unwrap_invoke_result`) is what lets the hook be async, and
+        # keeps a subclass override of the unwrap composing with the hook
+        # rather than racing it. Every fatal path returned/raised above.
+        if isinstance(unwrapped, _MCPCallError):
+            return await self._apply_tool_error_hook(unwrapped, tool_name=name)
+        return unwrapped
 
     async def aclose(self) -> None:
         """Close the owned :class:`httpx.AsyncClient`, if any.
@@ -672,6 +785,16 @@ class MCPClient:
             consumers running against untrusted MCP servers SHOULD scrub
             :attr:`_MCPCallError.content` before logging.
 
+            The sanctioned scrubbing point is the ``on_tool_error`` hook on
+            :class:`MCPClient` (BR-010): it receives BOTH this bounded
+            ``message`` and this raw ``content``, and its returned string is what
+            the model sees. It is applied by :meth:`_apply_tool_error_hook` one
+            frame up, in :meth:`invoke`, *after* this method returns — NOT here,
+            so that a subclass override of this (private, unsupported) method
+            composes with the hook rather than racing it. Overriding this method
+            or importing :class:`_MCPCallError` is NOT a supported extension
+            point; ``on_tool_error`` is.
+
         Success shape:
             Returns ``result.structuredContent`` when the server provides it
             (a JSON object), else the content blocks serialised to plain JSON
@@ -686,9 +809,97 @@ class MCPClient:
             return result.structuredContent
         return [c.model_dump(mode="json") for c in result.content]
 
+    async def _apply_tool_error_hook(self, err: _MCPCallError, *, tool_name: str) -> _MCPCallError:
+        """Apply the ``on_tool_error`` seam to a per-call ``isError`` outcome (BR-010).
+
+        Called by :meth:`invoke` ONLY inside its ``isinstance(..., _MCPCallError)``
+        branch, so it is structurally unreachable on the fatal
+        transport/protocol/session path (which raised :class:`MCPError` at the
+        ``call_tool`` boundary). The recoverable/fatal split of BR-005 is
+        untouched: this method can only ever rewrite one string.
+
+        Contract:
+
+        * ``on_tool_error is None`` (the default) — return ``err`` BY IDENTITY
+          before the hook is called, before any :func:`inspect.isawaitable`
+          check, and before any new carrier is constructed. The hook-off path
+          is byte-for-byte the pre-BR-010 path.
+        * Otherwise call ``hook(err.message, err.content)`` exactly once and
+          await the result if it is awaitable (inspecting the RESULT, not the
+          function, is correct for every callable shape — the same rule as
+          :func:`fifty_agent_sdk.observability.hooks.invoke_hook`).
+        * On ANY failure the ORIGINAL bounded ``err`` is returned unchanged, so
+          ``ToolResult.error`` can never become ``None``, ``""``, or a
+          non-string via this seam: a raising hook is caught and logged
+          ``mcp.tool_error_hook_failed``; a non-``str`` or blank return is
+          rejected and logged ``mcp.tool_error_hook_invalid``.
+        * :class:`asyncio.CancelledError` is re-raised untouched.
+
+        Args:
+            err: The per-call error carrier produced by
+                :meth:`_unwrap_invoke_result`.
+            tool_name: Remote tool name, used only for the WARNING log lines.
+
+        Returns:
+            ``err`` itself when no hook is configured or the hook failed;
+            otherwise a new :class:`_MCPCallError` carrying the hook's string as
+            ``message`` and the SAME ``content`` list.
+
+        Raises:
+            asyncio.CancelledError: Re-raised untouched if the hook raises it.
+        """
+        hook = self._on_tool_error
+        # Zero-overhead guard: nothing is called, inspected, or allocated when
+        # no hook is configured.
+        if hook is None:
+            return err
+        try:
+            returned = hook(err.message, err.content)
+            result: Any = await returned if inspect.isawaitable(returned) else returned
+        # Ordering is load-bearing (the codebase's classification-ordering rule,
+        # cf. loop.py): the CancelledError arm MUST precede the Exception arm so
+        # consumer cancellation propagates instead of being swallowed into the
+        # fallback. CancelledError is a BaseException on 3.11+, so this is
+        # defensive documentation of intent — keep it, reviewers look for it.
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # DELIBERATE DIVERGENCE from `invoke_hook`, which logs `str(exc)`:
+            # a hook screening untrusted server content may embed that content
+            # in its own exception message (`ValueError(f"bad: {content}")`), and
+            # this module's standing rule is that untrusted material never
+            # reaches a log line. Log the exception TYPE only — never its text,
+            # never `content`, never the message.
+            _log.warning(
+                "mcp.tool_error_hook_failed",
+                tool_name=tool_name,
+                error_type=type(exc).__name__,
+            )
+            return err
+        if not isinstance(result, str):
+            _log.warning(
+                "mcp.tool_error_hook_invalid",
+                tool_name=tool_name,
+                returned_type=type(result).__name__,
+                reason="not_a_string",
+            )
+            return err
+        if not result.strip():
+            _log.warning(
+                "mcp.tool_error_hook_invalid",
+                tool_name=tool_name,
+                returned_type=type(result).__name__,
+                reason="blank_string",
+            )
+            return err
+        # `content` is carried over unchanged: the hook may only rewrite the
+        # model-facing message, never the retained diagnostic evidence.
+        return _MCPCallError(message=result, content=err.content)
+
 
 __all__ = [
     "MCPClient",
     "MCPClientConfig",
     "MCPToolDef",
+    "MCPToolErrorHook",
 ]

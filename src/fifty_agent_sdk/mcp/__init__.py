@@ -26,14 +26,29 @@ Supported MCP surface
     (``notifications/tools/list_changed``) is deferred; the client is
     poll-only (see :class:`fifty_agent_sdk.tools.mcp_provider.MCPProvider` for the
     periodic-refresh loop).
+
+Error-content seam
+    A per-call ``tools/call`` ``isError=True`` result carries
+    upstream-controlled prose. :class:`MCPClient` accepts a keyword-only
+    ``on_tool_error`` callback (typed :data:`MCPToolErrorHook`) that receives
+    the SDK's bounded message AND the server's raw content blocks and returns
+    the string the model will see — the public, semver-protected way to screen,
+    redact, or reshape that text (BR-010). It is off by default and fires only
+    on the recoverable ``isError`` path.
 """
 
 from __future__ import annotations
 
-from fifty_agent_sdk.mcp.client import MCPClient, MCPClientConfig, MCPToolDef
+from fifty_agent_sdk.mcp.client import (
+    MCPClient,
+    MCPClientConfig,
+    MCPToolDef,
+    MCPToolErrorHook,
+)
 
 __all__ = [
     "MCPClient",
     "MCPClientConfig",
     "MCPToolDef",
+    "MCPToolErrorHook",
 ]

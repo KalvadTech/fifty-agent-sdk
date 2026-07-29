@@ -71,17 +71,22 @@ async def make_compat_client(
     server: FastMCP,
     *,
     auth: Any = None,
+    on_tool_error: Any = None,
 ) -> AsyncIterator[MCPClient]:
     """Connect a real official session to ``server`` and wire an ``MCPClient``.
 
     The returned client's ``_build_transport`` is replaced with one that
     yields the in-memory official session, so ``discover``/``invoke`` exercise
     the production mapping/unwrap path against the official client/server pair.
+
+    ``on_tool_error`` is forwarded verbatim into the ``MCPClient`` constructor
+    (BR-010). Defaulting it to ``None`` keeps every existing call site — and the
+    behaviour they pin — unchanged.
     """
     config = MCPClientConfig(base_url=MCP_URL)
     async with create_connected_server_and_client_session(server) as session:
         await session.initialize()
-        client = MCPClient(config, auth=auth)
+        client = MCPClient(config, auth=auth, on_tool_error=on_tool_error)
         transport = InMemorySessionTransport(session)
 
         def _build_transport(headers: Any) -> InMemorySessionTransport:
@@ -176,13 +181,20 @@ class _ControllableTransport:
         yield _ControllableSession(self._server)
 
 
-def make_controllable_client(server: ControllableServer) -> MCPClient:
+def make_controllable_client(
+    server: ControllableServer,
+    *,
+    on_tool_error: Any = None,
+) -> MCPClient:
     """Wire an ``MCPClient`` whose transport is driven by ``server``.
 
     The returned client runs the production mapping/unwrap/error-translation
     code, but its catalog/handlers are programmable and mutable mid-test.
+
+    ``on_tool_error`` is forwarded verbatim into the ``MCPClient`` constructor
+    (BR-010); the ``None`` default keeps every existing call site unchanged.
     """
-    client = MCPClient(MCPClientConfig(base_url=MCP_URL))
+    client = MCPClient(MCPClientConfig(base_url=MCP_URL), on_tool_error=on_tool_error)
     transport = _ControllableTransport(server)
 
     def _build_transport(headers: Any) -> _ControllableTransport:

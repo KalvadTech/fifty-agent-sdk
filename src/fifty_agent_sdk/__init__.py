@@ -49,7 +49,7 @@ from fifty_agent_sdk.llm import (
     Usage,
 )
 from fifty_agent_sdk.loop import AgentLoop
-from fifty_agent_sdk.mcp import MCPClient, MCPClientConfig, MCPToolDef
+from fifty_agent_sdk.mcp import MCPClient, MCPClientConfig, MCPToolDef, MCPToolErrorHook
 from fifty_agent_sdk.observability import Hooks
 from fifty_agent_sdk.parser import (
     FinalAnswer,
@@ -143,6 +143,7 @@ __all__ = [
     "MCPError",
     "MCPProvider",
     "MCPToolDef",
+    "MCPToolErrorHook",
     "MaxIterationsExceeded",
     "MemoryStateStore",
     "MultiAction",

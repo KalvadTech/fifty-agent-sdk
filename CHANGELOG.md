@@ -4,6 +4,38 @@ All notable changes to `fifty-agent-sdk` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-07-29
+
+### Added
+- **A public hook for transforming MCP `isError` text before it reaches the
+  model.** `MCPClient` gains a keyword-only `on_tool_error` callback (typed
+  `MCPToolErrorHook`, exported from the package root) that receives BOTH the
+  SDK's bounded default message (`"MCP tool '<name>' returned isError=True"`)
+  AND the server's raw error `content` blocks, and returns the string the model
+  will see as `ToolResult.error`. Wire it through plain construction —
+  `MCPClient(config, on_tool_error=screen)` then `MCPProvider(client)`; no
+  subclassing required. The hook may be sync or `async def` (the return value is
+  inspected with `inspect.isawaitable`), and it fires exactly once per per-call
+  `isError=True` result — never on success, and never on a transport/protocol/
+  session failure, which still raises `MCPError` at the `call_tool` boundary
+  before the result is unwrapped (the BR-005 recoverable/fatal split is
+  unchanged). It cannot change `is_error` or `output`: a failed tool is never
+  reported as a success. On ANY hook failure the original bounded message is
+  used — a raising hook is caught and logged `WARNING`
+  (`mcp.tool_error_hook_failed`), and a non-`str` or blank/whitespace-only
+  return is rejected and logged `WARNING` (`mcp.tool_error_hook_invalid`); those
+  logs carry `tool_name`/`error_type`/`returned_type` only, never the exception
+  text and never the server content. `asyncio.CancelledError` propagates
+  untouched. **Default `None` — the hook-off path is byte-for-byte the 1.3.0
+  path**, short-circuiting before any call or allocation.
+
+  **This is the supported replacement for importing
+  `fifty_agent_sdk.mcp.client._MCPCallError` or overriding
+  `MCPClient._unwrap_invoke_result`.** Those symbols remain private,
+  unsupported, and carry no semver protection — they are unchanged and
+  source-compatible in 1.4.0, so nothing breaks on upgrade, but consumers doing
+  either should migrate to `on_tool_error`. (BR-010)
+
 ## [1.3.0] - 2026-07-01
 
 ### Added

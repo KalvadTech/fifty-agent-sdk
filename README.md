@@ -125,6 +125,26 @@ the caps that bound a run: a max-iteration ceiling on react cycles and a per-too
 
 the audit sinks and observability hooks. they record what the agent did, so a run can be read back after it finishes.
 
+### mcp
+
+an mcp client over streamable http, adapted into the same registry the in-proc tools live in. a `tools/call` that comes back `isError=True` is a recoverable observation the model can reason about, not a dead run — and `on_tool_error` is the seam for screening that server-controlled text before the model reads it.
+
+```python
+def screen(message: str, content: list[dict]) -> str:
+    # `message` is the sdk's bounded default; `content` is the server's raw
+    # error blocks (read-only). return the string the model should see.
+    if any("PII" in str(block) for block in content):  # your own predicate
+        return "the upstream tool failed"
+    return message
+
+
+client = MCPClient(MCPClientConfig(base_url=...), auth=..., on_tool_error=screen)
+provider = MCPProvider(client)
+await provider.attach(registry)
+```
+
+the hook may be sync or async, and it only ever fires on a per-call `isError` result — never on success, never on a transport failure (that still raises `MCPError`). if it raises, returns a non-string, or returns a blank string, the sdk falls back to its own bounded message and logs a warning; it can never change `is_error` or `output`.
+
 ## Architecture
 
 ```
@@ -188,7 +208,7 @@ editing a turn is a consumer-side fork-then-append, and the original line stays 
 # Edit a turn = fork the history before it, switch onto the new branch, then
 # append the edited message. `store` is any StateStore; import `ChatMessage`
 # from fifty_agent_sdk.
-branch = await store.fork(session_id, from_sequence=4)   # keep messages 1..4
+branch = await store.fork(session_id, from_sequence=4)  # keep messages 1..4
 await store.switch_branch(session_id, branch)
 await store.append(session_id, ChatMessage(role="user", content="...edited..."))
 await store.get_messages(session_id, branch_id="trunk")  # original line intact
