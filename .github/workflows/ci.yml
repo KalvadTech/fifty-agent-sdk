@@ -26,6 +26,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,sql,redis]"
 
+      # Records exactly which tools produced the verdict below, so a local-vs-CI
+      # disagreement is diagnosable from the log alone (TD-004).
+      - name: Tool versions
+        run: |
+          ruff --version
+          mypy --version
+
       - name: Ruff lint
         run: ruff check .
 

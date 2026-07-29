@@ -50,16 +50,48 @@ redis = [
     "redis>=5.0.0",
 ]
 dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-cov>=4.1.0",
-    "pytest-httpx>=0.30.0",
-    "ruff>=0.1.0",
-    "mypy>=1.8.0",
-    "aiosqlite>=0.19.0",
+    # Dev-toolchain pin policy (TD-004). The two verdict-generating tools are
+    # pinned EXACTLY because their output IS the CI verdict: `ruff format`
+    # decides on output bytes and `mypy --strict` surfaces new errors on
+    # unchanged code, so any upstream release — including a patch — can turn CI
+    # red with no change in this repo (ruff 0.16.0 promoted markdown formatting
+    # out of preview and did exactly that). The rest of the harness keeps its
+    # floor and gains a major ceiling, which is what actually stops a future
+    # major from reddening CI. Consumer-facing specifiers ([project]
+    # dependencies and the sql / redis extras) are DELIBERATELY left unbounded
+    # here — that is a decision, not an oversight: a ceiling there ships into
+    # every downstream resolver and pip cannot relax it, so this repo's CI
+    # reproducibility is not theirs to inherit; bound those only where drift is
+    # actually observed (see openai / mcp above). Bumps arrive as Dependabot
+    # PRs (.github/dependabot.yml) that this same gate validates.
+    #
+    # These pins are a FORWARD GUARD, not a repair: the tree is currently clean
+    # under both ruff 0.16.0 and mypy 2.3.0 (measured), because the markdown
+    # that 0.16.0 reddened was reformatted before this pin landed. What the pin
+    # buys is that the NEXT such release cannot change the verdict without a
+    # reviewable diff. Re-check before accepting ruff >=0.16: it also adopts
+    # markdown formatting, which grows the format file-set from the .py files
+    # to every .md in the tree — including untracked local dirs CI cannot see,
+    # so re-verify local and CI report the same file count after the bump.
+    "pytest>=7.4.0,<10.0.0",
+    "pytest-asyncio>=0.23.0,<2.0.0",
+    "pytest-cov>=4.1.0,<8.0.0",
+    # The two pre-1.0 harness packages take MINOR ceilings, not major ones. For
+    # a 0.x package a `<1.0.0` bound is functionally no bound: it permits every
+    # future minor, and those are exactly where a 0.x project ships breaking
+    # changes (pytest-httpx tracks httpx). It also silences the update path —
+    # Dependabot only opens a PR when the new version falls OUTSIDE the
+    # declared range, so a `<1.0.0` ceiling means no bump is ever proposed and
+    # the ceiling never engages. A minor ceiling stays patch-permissive and
+    # puts the next minor in front of a reviewer with CI attached.
+    "pytest-httpx>=0.30.0,<0.37.0",
+    "ruff==0.15.18",
+    "mypy==2.1.0",
+    "aiosqlite>=0.19.0,<0.23.0",
     # fakeredis must track the redis major version (redis>=5.0.0 above):
     # the SDK relies on 5.x async semantics — aclose(), pipeline(transaction=True).
-    "fakeredis>=2.20.0",
+    # The <3.0.0 ceiling enforces what this comment has always asserted.
+    "fakeredis>=2.20.0,<3.0.0",
 ]
 
 [tool.setuptools.packages.find]

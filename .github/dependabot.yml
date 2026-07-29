@@ -1,0 +1,44 @@
+# Dependabot — the recorded update path for this repo's pinned dev toolchain.
+#
+# This file IS the update mechanism required by TD-004. The `dev` extra in
+# pyproject.toml exact-pins `ruff` and `mypy` and ceilings the test harness so
+# an upstream release cannot change the CI verdict without a reviewable diff;
+# the trade is that pins rot unless something proposes the bump. Dependabot
+# opens that proposal as a PR, which runs the same four-command gate the pin
+# protects — so every bump is validated by the thing it might break.
+#
+# Deliberately NOT covered here: the `github-actions` ecosystem. The workflow
+# action pins (actions/checkout@v5, actions/setup-python@v6) are a real but
+# separate exposure and belong to their own change, not to TD-004.
+#
+# VERIFY REGISTRATION, once, after this lands: repo -> Insights -> Dependency
+# graph -> Dependabot should list this manifest. If it does not detect the PEP
+# 621 setuptools [project.optional-dependencies] table, nothing here runs and
+# the exact pins freeze silently — which is the exact rot this file exists to
+# prevent. On non-detection, fall back to a manual quarterly bump and record
+# that in the coding_guidelines.md Decisions row, so the obligation survives
+# outside this file.
+
+version: 2
+
+updates:
+  - package-ecosystem: "pip"
+    # Reads the PEP 621 [project.optional-dependencies] tables in pyproject.toml.
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      # The repo uses Conventional Commits.
+      prefix: "chore"
+    groups:
+      # One grouped PR per week, so a week's tool bumps get one CI run and one
+      # review rather than five competing branches.
+      dev-tooling:
+        patterns:
+          - "ruff"
+          - "mypy"
+          - "pytest*"
+          - "aiosqlite"
+          - "fakeredis"
