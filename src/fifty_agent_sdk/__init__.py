@@ -14,6 +14,13 @@ Optional extra surface
     SQLAlchemy nor redis-py. First access to one of these symbols triggers
     its import and raises a clear :class:`ImportError` if the relevant
     extra is missing.
+
+Supported surface
+    ``fifty_agent_sdk.__all__`` is the API contract. Any ``_``-prefixed name,
+    at any depth in this package, is internal: it carries **no semver
+    protection** and may be renamed, re-signatured or removed in a PATCH
+    release. If no public surface does what you need, that gap is a bug in this
+    SDK — please open an issue rather than reaching into a private symbol.
 """
 
 from __future__ import annotations

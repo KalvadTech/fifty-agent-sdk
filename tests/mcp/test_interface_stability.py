@@ -2,10 +2,20 @@
 
 BR-042 swapped the hand-rolled JSON-RPC internals for the official ``mcp``
 SDK while holding the public surface byte-for-byte stable (the load-bearing
-contract: vendored consumers — notably ``mbrgea-ai`` — need only a re-vendor +
+contract: vendored consumers need only a re-vendor +
 dependency bump, no code change). This test pins that surface with
 :func:`inspect.signature` / :func:`getattr` so a rename or signature drift
 fails here loudly rather than at a downstream consumer.
+
+**If you are here because this test went red:** the consumers this surface is
+pinned *for* are recorded in ``MAINTAINING.md`` (the MCP public surface row).
+A change that lands here needs that row swept in the same commit — including
+the two couplings the assertions below cannot express: the module path
+``fifty_agent_sdk.mcp.client`` (patched by string in a consumer's tests) and
+the fact that ``on_tool_error`` fires *inside* :meth:`MCPClient.invoke` (a
+consumer subclasses the client and overrides that method). ``MAINTAINING.md``
+also states the private-symbol policy: nothing ``_``-prefixed is covered here
+or anywhere.
 """
 
 from __future__ import annotations

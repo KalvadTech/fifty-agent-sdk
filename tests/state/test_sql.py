@@ -700,6 +700,20 @@ def test_metadata_unique_constraint_on_session_branch_sequence() -> None:
     )
 
 
+def test_metadata_pins_constraint_and_index_names() -> None:
+    """The uq_/ix_ DDL names a downstream Alembic chain drops BY NAME are pinned (TD-003).
+
+    The constraint test above matches on *columns* and never on ``name=``, and
+    nothing asserted the index name at all — so renaming either string left this
+    suite fully green. A consumer that hand-transcribes this ORM into its own
+    migrations drops and recreates exactly these two names, so a silent rename
+    desynchronises its database. See MAINTAINING.md's physical-schema row.
+    """
+    messages = sql_metadata.tables["agent_messages"]
+    assert "uq_agent_messages_session_branch_sequence" in {c.name for c in messages.constraints}
+    assert "ix_agent_messages_session_branch_sequence" in {i.name for i in messages.indexes}
+
+
 def test_metadata_foreign_key_cascades_at_schema_level() -> None:
     """The FK from agent_messages.session_id is declared ON DELETE CASCADE."""
     messages = sql_metadata.tables["agent_messages"]
