@@ -65,9 +65,9 @@ jobs:
       # Consumed by the publish job's round-trip verification (TD-008).
       dist-sha256: ${{ steps.checksums.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -98,7 +98,13 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      # TD-008: `archive: false` (v7's opt-in direct upload) is deliberately NOT
+      # set. With it, `name` is IGNORED and the uploaded filename becomes the
+      # artifact name — which would break the publish job below, since that
+      # downloads by `name: dist`. (It also only supports a single file, so it
+      # could not carry both the sdist and the wheel.) The default zipped path
+      # is what download-artifact@v8 round-trips here.
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -111,7 +117,19 @@ jobs:
     permissions:
       id-token: write  # required for Trusted Publishing (OIDC)
     steps:
-      - uses: actions/download-artifact@v4
+      # TD-008: paired with upload-artifact@v7 above. Downloading a SINGLE named
+      # artifact still extracts directly into `path` (v5's path fix applied to
+      # ID-based downloads, which we do not use), so `dist/` stays flat — the
+      # `Verify artifact round-trip` step below proves it rather than assuming.
+      #
+      # Layout is not the only v8 risk. The `permissions:` block above zeroes
+      # every scope it does not name, including `actions`. Same-run artifact
+      # downloads authenticate with ACTIONS_RUNTIME_TOKEN, so v4 needed no
+      # `actions: read` — but if a later major moved same-run downloads onto the
+      # REST API and GITHUB_TOKEN, this step fails on AUTHORIZATION, not on
+      # layout, and the verify step below would never run to tell you so. If a
+      # dispatch goes red here, read THIS step's log, not just the verdict.
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
