@@ -26,3 +26,13 @@ htmlcov/
 *.swp
 .idea/
 .vscode/
+
+# Agent / harness state — local working notes, not SDK source.
+# Also load-bearing for the lint gate: from ruff 0.16.0 onwards `ruff format`
+# checks python fences inside .md files, and ruff walks the working tree rather
+# than the index. Without this entry a local run would check .claude/**/*.md
+# that CI (which only has committed content) cannot see — different file counts
+# local vs CI, which is exactly how the ruff 0.16.0 incident was diagnosed.
+# `respect-gitignore` defaults to true, so this entry is what keeps the two
+# in agreement; no [tool.ruff] extend-exclude is needed. (TD-006)
+.claude/
