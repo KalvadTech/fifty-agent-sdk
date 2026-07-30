@@ -69,3 +69,36 @@ updates:
       # entry is pre-emptive rather than CI-proven.
       - dependency-name: "openai"
         update-types: ["version-update:semver-major"]
+      #
+      # SCOPE OF THESE IGNORES vs SECURITY UPDATES (TD-007). An `ignore` entry
+      # suppresses the update PR, NOT the Dependabot ALERT — so a CVE in mcp or
+      # openai still surfaces either way and the signal is never lost. What is
+      # suppressed is only the automated fix, and only when that fix requires the
+      # ignored MAJOR. A security fix shipped as a minor or patch below each
+      # ceiling still arrives as a PR, because these entries are scoped to
+      # `version-update:semver-major`. If a CVE ever requires mcp 2.x, the fix is
+      # the migration described above, which was never automatable anyway.
+
+  # The workflows that build and PUBLISH TO PYPI run these actions, so they are a
+  # supply-chain surface for the released artifact (TD-007; TD-004 deferred this
+  # deliberately, and the dependency graph now confirms all five are visible).
+  #
+  # KNOW WHAT THIS DOES AND DOES NOT BUY. Everything is pinned to a floating
+  # major tag (@v5, @v6, @v4) or, for the publish step, a BRANCH (@release/v1).
+  # Dependabot bumps v5 -> v6 when a new major ships. It does NOT protect against
+  # the upstream owner re-pointing an existing tag or branch at new code, which is
+  # the actual attack. Only SHA pinning does that, at the cost of readability and
+  # of relying on Dependabot to keep the SHAs current. That is a separate
+  # decision and is deliberately NOT taken here.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
