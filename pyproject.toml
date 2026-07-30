@@ -17,9 +17,14 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    # TS-001: these mirror the CI matrix in .github/workflows/ci.yml, which in
+    # turn must cover everything `requires-python` above admits. Add a version
+    # here only once CI actually runs it — a classifier is a claim, and the
+    # matrix is the only thing that backs it.
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Typing :: Typed",
 ]

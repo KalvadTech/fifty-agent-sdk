@@ -12,7 +12,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # TS-001: this list must cover everything `requires-python` in
+        # pyproject.toml admits. That bound is `>=3.11` — open at the top — so
+        # pip will install this package on any future Python, and every version
+        # missing from this matrix is a support claim nothing checks. A green CI
+        # is not evidence about a version CI does not run (the TD-004 / TD-008
+        # shape).
+        #
+        # So when a new CPython final lands, one of two things has to happen and
+        # neither is the default: add it here, or close `requires-python`. The
+        # trailing entry and the last classifier in pyproject.toml move together.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
 
