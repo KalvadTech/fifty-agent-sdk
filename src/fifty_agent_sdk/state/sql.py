@@ -829,13 +829,34 @@ class SqlStateStore:
         history is its parent's history truncated at the fork point (a count of
         inherited messages), followed by its own messages. ``by_branch`` maps
         each branch id to its own messages in append order.
+
+        That definition is recursive; the computation is **iterative**
+        (TD-002), so lineage depth is bounded only by memory and not by
+        Python's recursion limit.
         """
-        parent, anchor = branch_map[branch_id]
-        own = by_branch.get(branch_id, [])
-        if parent is None:
-            return list(own)
-        parent_hist = SqlStateStore._materialize_positional(branch_map, by_branch, parent)
-        return parent_hist[: anchor or 0] + list(own)
+        # Walk parent pointers leaf -> root (pure pointer work over
+        # branch_map), then fold root -> leaf. No cycle guard, deliberately:
+        # parent_branch_id is written once, in fork(), to the already-existing
+        # active branch and never mutated, so the lineage is acyclic by
+        # construction. Honest asymmetry (TD-002): an externally corrupted row
+        # introducing a cycle used to raise RecursionError and would now spin
+        # forever; that is unreachable through any public API.
+        chain: list[tuple[str, int | None]] = []
+        bid: str | None = branch_id
+        while bid is not None:
+            parent, anchor = branch_map[bid]  # KeyError on a missing branch: preserved
+            chain.append((bid, anchor))
+            bid = parent
+        chain.reverse()  # root .. leaf
+
+        # Base case and step mirror the recursive form literally, and stay
+        # separate, so the two can be diffed line for line.
+        root_id, _ = chain[0]
+        # `chain` is non-empty: branch_id is never None, so the walk ran once.
+        history = list(by_branch.get(root_id, []))  # base case: the trunk
+        for cur_id, cur_anchor in chain[1:]:  # step
+            history = history[: cur_anchor or 0] + list(by_branch.get(cur_id, []))
+        return history
 
     @staticmethod
     def _materialized_len(
@@ -851,13 +872,32 @@ class SqlStateStore:
         portion is bounded by the ancestor's (shortened) length, matching the
         Memory reference. This is the head used for ``fork`` bounds and
         :class:`BranchInfo.head_sequence`.
+
+        **Computed iteratively** (TD-002). The recursive form was already a
+        left fold from the root — each hop depends only on its parent — so the
+        fold below runs root -> leaf and every hop's ``min`` still sees the
+        already-``min``-clamped ancestor length. Same expression, same
+        associativity, no Python frame per lineage hop.
         """
-        parent, anchor = branch_map[branch_id]
-        own = own_counts.get(branch_id, 0)
-        if parent is None:
-            return own
-        parent_len = SqlStateStore._materialized_len(branch_map, own_counts, parent)
-        return min(anchor or 0, parent_len) + own
+        # Walk parent pointers leaf -> root, then fold root -> leaf. No cycle
+        # guard, deliberately — see _materialize_positional for the reasoning
+        # and the honest asymmetry it accepts (TD-002).
+        chain: list[tuple[str, int | None]] = []
+        bid: str | None = branch_id
+        while bid is not None:
+            parent, anchor = branch_map[bid]  # KeyError on a missing branch: preserved
+            chain.append((bid, anchor))
+            bid = parent
+        chain.reverse()  # root .. leaf
+
+        # Base case and step mirror the recursive form literally, and stay
+        # separate, so the two can be diffed line for line.
+        root_id, _ = chain[0]
+        # `chain` is non-empty: branch_id is never None, so the walk ran once.
+        length = own_counts.get(root_id, 0)  # base case: the trunk
+        for cur_id, cur_anchor in chain[1:]:  # step
+            length = min(cur_anchor or 0, length) + own_counts.get(cur_id, 0)
+        return length
 
     async def _own_counts(self, session: AsyncSession, session_id: str) -> dict[str, int]:
         """Return ``{branch_id: own_message_count}`` for the session (one query)."""

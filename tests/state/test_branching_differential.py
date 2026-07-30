@@ -8,6 +8,12 @@ regressions for bugs found in pre-release review (the BR-003 × BR-004
 interaction): SQL by-position materialization after an ancestor truncation,
 SQL/Redis materialized-length head after an ancestor truncation, and the Redis
 trunk-only-truncated-to-empty session-existence bug.
+
+It also carries a *linear-chain* agreement case (TD-002): the randomized
+sequences fork from whatever branch is active, which produces wide, shallow
+trees, so a 40-deep chain is built explicitly. Depth past Python's recursion
+limit is pinned separately in ``test_deep_lineage.py``; the case here pins that
+making the lineage walk iterative did not change WHAT any backend computes.
 """
 
 from __future__ import annotations
@@ -159,6 +165,30 @@ async def test_backends_agree_under_random_ops(
                 await store.truncate_after(sid, n)
 
         await _assert_agree(stores, bids)
+
+
+async def test_deep_linear_chain_agrees_across_backends(
+    stores: list[tuple[str, StateStore]],
+) -> None:
+    """A 40-deep LINEAR fork chain reads identically on all three backends —
+    active read, every branch read, and every head_sequence (TD-002).
+
+    Depth 40 is deliberate: this case pins cross-backend *agreement* on a
+    lineage shape the randomized sequences barely produce, not depth itself.
+    Depth past Python's recursion limit is pinned in ``test_deep_lineage.py``,
+    which the O(depth**2) public build loop used here could not afford.
+    """
+    sid = "s"
+    bids: dict[str, list[str]] = {name: [TRUNK_BRANCH_ID] for name, _ in stores}
+    for _, store in stores:
+        await store.append(sid, _M("seed"))
+    for _ in range(40):
+        for name, store in stores:
+            new_id = await store.fork(sid, 1)
+            await store.switch_branch(sid, new_id)
+            bids[name].append(new_id)
+
+    await _assert_agree(stores, bids)
 
 
 # ---------------------------------------------------------------------------

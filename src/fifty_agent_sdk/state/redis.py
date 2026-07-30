@@ -362,15 +362,43 @@ class RedisStateStore:
         """Materialize a branch's full history: ``parent_history[:fork] + own``.
 
         Mirrors :meth:`MemoryStateStore._materialize`; each branch's own list
-        is one ``LRANGE`` and the recursion walks the lineage to the trunk.
+        is one ``LRANGE`` and the lineage is walked to the trunk.
+
+        The walk is **iterative** (TD-002) — an ``await``ed recursive call
+        consumes a Python frame just as a synchronous one does, so a deep
+        linear fork chain used to raise :class:`RecursionError` here. The
+        per-hop ``LRANGE`` count and the command set are unchanged; only the
+        *order* flips, from leaf-to-root to root-to-leaf. Multi-key reads were
+        never atomic in either order and no ordering was ever documented, so no
+        contract moves. The per-hop calls are deliberately NOT pipelined.
         """
-        parent, anchor = branch_map[branch_id]
-        raw = await cast("Any", self._client.lrange(self._msgs_key(session_id, branch_id), 0, -1))
-        own = [ChatMessage.model_validate_json(item) for item in raw]
-        if parent is None:
-            return own
-        parent_hist = await self._materialize(session_id, parent, branch_map)
-        return parent_hist[: anchor or 0] + own
+        # Phase 1: walk parent pointers leaf -> root. Reads only branch_map,
+        # so this phase issues zero commands. No cycle guard, deliberately:
+        # parent_branch_id is written once, in fork(), to the already-existing
+        # active branch and never mutated, so the lineage is acyclic by
+        # construction. Honest asymmetry (TD-002): a hand-edited registry hash
+        # holding a cycle used to raise RecursionError and would now spin
+        # forever; that is unreachable through any public API.
+        chain: list[tuple[str, int | None]] = []
+        bid: str | None = branch_id
+        while bid is not None:
+            parent, anchor = branch_map[bid]  # KeyError on a missing branch: preserved
+            chain.append((bid, anchor))
+            bid = parent
+        chain.reverse()  # root .. leaf
+
+        # Phase 2: fold root -> leaf, one LRANGE per hop. The base case and the
+        # step mirror the recursive form literally, and stay separate, so the
+        # two can be diffed line for line.
+        root_id = chain[0][0]
+        raw = await cast("Any", self._client.lrange(self._msgs_key(session_id, root_id), 0, -1))
+        # `chain` is non-empty: branch_id is never None, so the walk ran once.
+        history = [ChatMessage.model_validate_json(item) for item in raw]  # base case: the trunk
+        for cur_id, cur_anchor in chain[1:]:  # step
+            raw = await cast("Any", self._client.lrange(self._msgs_key(session_id, cur_id), 0, -1))
+            own = [ChatMessage.model_validate_json(item) for item in raw]
+            history = history[: cur_anchor or 0] + own
+        return history
 
     async def _materialized_len(
         self,
@@ -384,13 +412,35 @@ class RedisStateStore:
         :meth:`_materialize`. ``min`` is load-bearing when an ancestor was
         truncated below this branch's fork point. Used for ``fork`` bounds and
         :class:`BranchInfo.head_sequence`.
+
+        **Computed iteratively** (TD-002). The recursive form was already a left
+        fold from the root — each hop depends only on its parent — so the fold
+        below runs root -> leaf and every hop's ``min`` still sees the
+        already-``min``-clamped ancestor length. Same expression, same
+        associativity. As in :meth:`_materialize` the per-hop ``LLEN`` count is
+        unchanged and only the call *order* flips to root -> leaf; the calls are
+        deliberately NOT pipelined.
         """
-        parent, anchor = branch_map[branch_id]
-        own = int(await cast("Any", self._client.llen(self._msgs_key(session_id, branch_id))))
-        if parent is None:
-            return own
-        parent_len = await self._materialized_len(session_id, parent, branch_map)
-        return min(anchor or 0, parent_len) + own
+        # Walk parent pointers leaf -> root (zero commands), then fold
+        # root -> leaf. No cycle guard, deliberately — see :meth:`_materialize`
+        # for the reasoning and the honest asymmetry it accepts (TD-002).
+        chain: list[tuple[str, int | None]] = []
+        bid: str | None = branch_id
+        while bid is not None:
+            parent, anchor = branch_map[bid]  # KeyError on a missing branch: preserved
+            chain.append((bid, anchor))
+            bid = parent
+        chain.reverse()  # root .. leaf
+
+        # Base case and step mirror the recursive form literally, and stay
+        # separate, so the two can be diffed line for line.
+        root_id = chain[0][0]
+        # `chain` is non-empty: branch_id is never None, so the walk ran once.
+        length = int(await cast("Any", self._client.llen(self._msgs_key(session_id, root_id))))
+        for cur_id, cur_anchor in chain[1:]:  # step
+            own = int(await cast("Any", self._client.llen(self._msgs_key(session_id, cur_id))))
+            length = min(cur_anchor or 0, length) + own
+        return length
 
     async def _session_keys(self, session_id: str) -> list[str]:
         """Every Redis key backing a session (for TTL refresh and delete)."""

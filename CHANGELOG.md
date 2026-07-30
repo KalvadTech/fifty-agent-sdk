@@ -36,6 +36,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1.5.0, so nothing breaks on upgrade, but consumers reading it should migrate
   to `AgentRunner.state`. (BR-011)
 
+### Fixed
+- **Branch materialization no longer recurses per lineage hop.** All three
+  backends walked a branch's lineage with one Python frame per hop, so a
+  pathological *linear* fork chain (~990 deep) raised `RecursionError`. The five
+  affected walks — `MemoryStateStore._materialize`,
+  `SqlStateStore._materialize_positional` / `._materialized_len`, and
+  `RedisStateStore._materialize` / `._materialized_len` (the last two `async`,
+  where an `await`ed recursive call consumes a frame just the same) — now walk
+  parent pointers into a list and fold root-to-leaf. Lineage depth is bounded
+  only by memory.
+
+  The failure bit at **build** time before read time was reachable: `fork` computes the active
+  branch's head through the same walk to bound `from_sequence`, so on affected
+  versions a chain that deep could not be constructed through the public API at
+  all. Realistic branching is wide rather than 1000-deep-linear, which is why
+  this went unnoticed.
+
+  **No API and no behaviour change.** No signature moves (all five are private
+  helpers), and the fold evaluates the identical expression with the identical
+  associativity — the recursive form was already a left fold from the root, so
+  each hop's `min` / prefix-slice clamp still sees the already-clamped ancestor
+  length. The existing differential fuzz suite passes unmodified. On Redis the
+  per-hop `LRANGE`/`LLEN` count and command set are unchanged; only the call
+  *order* flips from leaf-to-root to root-to-leaf, and multi-key reads were
+  never atomic in either order.
+
+  The brief's optional half — wrapping these paths in `StateStoreError` — was
+  considered and **declined**: with the walk iterative the `RecursionError` it
+  guarded against is unreachable, and a broad `except Exception` there would
+  swallow the protocol-mandated `ValueError` for an unknown explicit `branch_id`
+  as well as Redis's deliberate pydantic `ValidationError` pass-through. No
+  lineage-cycle guard was added either — `parent_branch_id` is written once, at
+  `fork`, to an already-existing branch and never mutated, so the lineage is
+  acyclic by construction. (TD-002)
+
 ## [1.4.0] - 2026-07-29
 
 ### Added

@@ -19,7 +19,9 @@ Branching model
     materialized history is defined recursively as
     ``materialize(parent)[:fork_point] + own_messages`` — which naturally
     handles a branch forked from a point inside its parent's *inherited*
-    history. The implicit first branch is ``"trunk"``
+    history. That definition is recursive; the computation is **iterative**
+    (TD-002), so lineage depth is not bounded by Python's recursion limit.
+    The implicit first branch is ``"trunk"``
     (:data:`fifty_agent_sdk.state.protocol.TRUNK_BRANCH_ID`).
 
 Memory characteristics
@@ -126,15 +128,46 @@ class MemoryStateStore:
         truncated at the fork point, followed by the branch's own messages.
         The trunk (no parent) materializes to just its own messages. Returns
         a fresh list every call (defensive-copy invariant).
+
+        **Computed iteratively** (TD-002): the definition recurses, the
+        computation does not. Lineage depth is therefore bounded only by
+        memory, not by Python's recursion limit — a deep linear fork chain
+        previously raised :class:`RecursionError` from here (and so from
+        :meth:`fork`, which calls this to bound ``from_sequence``).
         """
-        branch = session.branches[branch_id]
-        if branch.parent_branch_id is None:
-            base: list[ChatMessage] = []
-        else:
-            parent_hist = MemoryStateStore._materialize(session, branch.parent_branch_id)
-            # forked_from_sequence is a 1-based count of inherited messages.
-            base = parent_hist[: branch.forked_from_sequence or 0]
-        return base + list(branch.messages)
+        # Phase 1: walk parent pointers leaf -> root. Pure pointer work.
+        # No cycle guard, deliberately (TD-002): parent_branch_id is written
+        # exactly once, in fork(), to the already-existing active branch, and
+        # is never mutated afterwards, so every branch's parent strictly
+        # precedes it in creation order and the lineage is acyclic by
+        # construction. The honest asymmetry: an externally corrupted store
+        # holding a cycle used to raise RecursionError and would now spin
+        # forever. That is unreachable through any public API.
+        chain: list[_Branch] = []
+        bid: str | None = branch_id
+        while bid is not None:
+            branch = session.branches[bid]  # KeyError on a missing branch: preserved
+            chain.append(branch)
+            bid = branch.parent_branch_id
+        chain.reverse()  # root .. leaf
+
+        # Phase 2: fold root -> leaf. The base case and the step mirror the
+        # recursive form literally (and stay separate) so this can be diffed
+        # against it line for line.
+        # `chain` is non-empty: branch_id is never None, so the walk ran once.
+        history: list[ChatMessage] = list(chain[0].messages)  # base case: the trunk
+        for branch in chain[1:]:  # step
+            # forked_from_sequence is a count of inherited messages.
+            #
+            # The slice clamps naturally when an ancestor was truncated below
+            # this fork point — a short `history` simply yields all of it. This
+            # is the IMPLICIT form of the explicit `min` in SqlStateStore and
+            # RedisStateStore `_materialized_len`, which cite this method as the
+            # reference. Same clamp, expressed by Python's slice semantics
+            # rather than by an arithmetic `min`; that equivalence is the seam
+            # the BR-003 x BR-004 differential regressions guard.
+            history = history[: branch.forked_from_sequence or 0] + list(branch.messages)
+        return history
 
     def _ensure_session(self, session_id: str) -> _Session:
         """Return the session, creating it (with an empty trunk) if absent."""
