@@ -4,6 +4,38 @@ All notable changes to `fifty-agent-sdk` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-07-30
+
+### Added
+- **A public accessor for a Runner's state store.** `AgentRunner` gains a
+  read-only `state` property returning the `StateStore` it reads and writes.
+  It returns the **exact instance** passed as the `state=` constructor keyword
+  — by identity, never a copy and never a wrapper — so a caller sharing it
+  shares the store's internal serialization (for example `SqlStateStore`'s
+  per-session `asyncio.Lock` registry). Constructing a second store over the
+  same engine is **not** equivalent: two stores carry independent lock
+  registries, so two writers could interleave on one session. The accessor is
+  named for its constructor keyword, making `AgentRunner(loop=…, state=s).state
+  is s` a derivable invariant. Reachable from the package root today —
+  `AgentRunner` and `StateStore` are both already exported.
+
+  It is **read-only** for correctness, not style: `run()` appends the user
+  message, drives the loop, then appends the assistant message, so a store swap
+  landing between those appends would split one turn across two backends and
+  void the documented transactional-persistence invariants. To use a different
+  store, construct another Runner — `__init__` does no I/O. Assignment raises
+  `AttributeError`, and `mypy` rejects it statically (there is deliberately no
+  raising setter, which would make the assignment type-check as legal). The
+  declared return type is the `StateStore` protocol, so a caller needing
+  backend-specific API that is not on it (e.g. `SqlStateStore.aclose()`) should
+  keep its own concretely-typed reference or narrow with `cast`.
+
+  **This is the supported replacement for reaching into
+  `AgentRunner._state`.** That attribute remains private, unsupported, and
+  carries no semver protection — it is unchanged and source-compatible in
+  1.5.0, so nothing breaks on upgrade, but consumers reading it should migrate
+  to `AgentRunner.state`. (BR-011)
+
 ## [1.4.0] - 2026-07-29
 
 ### Added

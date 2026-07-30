@@ -727,6 +727,67 @@ async def test_end_to_end_minimal_build() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Public state-store accessor (BR-011)
+# ---------------------------------------------------------------------------
+
+
+def test_runner_state_returns_the_exact_store_instance() -> None:
+    """``AgentRunner.state`` returns the store passed as ``state=`` by identity (BR-011).
+
+    The assertion is ``is``, not ``isinstance``: an ``isinstance`` check would
+    also pass for a SECOND store constructed over the same engine, which is the
+    wrong answer — a second store carries an independent per-session lock
+    registry, so two writers could interleave on one session.
+    """
+    llm = FakeLLMClient(replies=[])
+    store = MemoryStateStore()
+    runner, returned = make_runner(llm=llm, state=store)
+
+    assert runner.state is store
+    assert returned is store
+
+
+def test_runner_state_is_read_only() -> None:
+    """Assigning to ``AgentRunner.state`` raises at runtime (BR-011).
+
+    A mid-run store swap would split one turn's user and assistant appends
+    across two backends, voiding the transactional-persistence invariant.
+
+    What this does NOT pin, deliberately stated so the docstring does not
+    overclaim: it cannot tell the shipped design (a bare ``@property``, no
+    setter) from the design BR-011 rejected (a ``@state.setter`` that raises).
+    Both raise ``AttributeError`` here and this test passes either way —
+    verified. The difference is visible only to ``mypy``; see the comment at
+    the property for why. Nothing mechanical catches a future raising setter —
+    that comment is the only thing standing against it.
+    """
+    llm = FakeLLMClient(replies=[])
+    runner, _ = make_runner(llm=llm)
+
+    with pytest.raises(AttributeError):
+        runner.state = MemoryStateStore()
+
+
+async def test_runner_state_observes_writes_made_through_the_runner() -> None:
+    """``AgentRunner.state`` is the live store the Runner writes through (BR-011).
+
+    Not a snapshot and not a defensive copy: messages persisted by ``run()``
+    are visible through the accessor, and it is still the same object.
+    """
+    llm = FakeLLMClient(replies=[make_response(final_json("hi there"))])
+    store = MemoryStateStore()
+    runner, _ = make_runner(llm=llm, state=store)
+
+    await collect(runner.run("s1", "Hello"))
+
+    assert [m.role for m in await runner.state.get_messages("s1")] == [
+        "user",
+        "assistant",
+    ]
+    assert runner.state is store
+
+
+# ---------------------------------------------------------------------------
 # Helpers smoke check
 # ---------------------------------------------------------------------------
 

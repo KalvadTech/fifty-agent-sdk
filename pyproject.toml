@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fifty-agent-sdk"
-version = "1.4.0"
+version = "1.5.0"
 description = "Production-grade reusable agent loop SDK — custom ReACT, JSON-mode tool calls, MCP client, pluggable LLM/state/tools."
 readme = "README.md"
 requires-python = ">=3.11"

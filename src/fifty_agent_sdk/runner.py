@@ -236,6 +236,10 @@ class AgentRunner:
         * A Runner-level ``run_id`` is generated per ``run()`` call for
           log correlation and is SEPARATE from the inner :class:`AgentLoop`
           run id. Neither id is exposed on :class:`AgentEvent` values.
+        * The :class:`StateStore` passed as ``state`` is retrievable by
+          identity through the read-only :attr:`state` property and is
+          FIXED for the Runner's lifetime — the store this Runner reads
+          and writes never changes after construction.
     """
 
     def __init__(
@@ -252,6 +256,54 @@ class AgentRunner:
         self._system_prompt = system_prompt
         self._audit = audit
         self._hooks = hooks
+
+    # A bare ``@property`` with NO setter is deliberate, and a raising
+    # ``@state.setter`` would be worse than nothing: defining a setter makes
+    # ``runner.state = x`` type-check as LEGAL, converting a failure ``mypy``
+    # catches at the consumer's keyboard into one that only appears at
+    # runtime. With no setter, assignment is both a static error and an
+    # ``AttributeError``. Do not "improve" this by adding one. (BR-011)
+    @property
+    def state(self) -> StateStore:
+        """The :class:`StateStore` this Runner reads and writes.
+
+        Returns the EXACT instance passed as the ``state`` constructor
+        keyword — by identity, never a copy and never a wrapper. That
+        identity is the whole point: sharing this object shares the store's
+        internal serialization (for example
+        :class:`fifty_agent_sdk.state.sql.SqlStateStore`'s per-session
+        :class:`asyncio.Lock` registry), which a SECOND store constructed
+        over the same engine would NOT share — two such stores carry
+        independent lock registries, so two writers could interleave on one
+        session. Use this instead of reaching for the private ``_state``
+        attribute, which carries no semver protection.
+
+        Read-only, for correctness rather than style. ``run()`` loads
+        history, appends the user message, drives the loop, and only then
+        appends the assistant message. A settable store would let a swap
+        land BETWEEN those appends, splitting one turn's user and assistant
+        messages across two backends and silently voiding the
+        transactional-persistence invariants documented on this class and
+        in the module docstring. The store is fixed at construction because
+        the invariant requires it. To run against a different store,
+        construct another Runner: ``state`` is a constructor keyword and
+        :meth:`__init__` does no I/O, opens nothing, and starts no task, so
+        a Runner is free to build.
+
+        The declared type is the :class:`StateStore` protocol, because that
+        is all the Runner knows. A caller who needs backend-specific API
+        that is NOT on the protocol (for example
+        :meth:`SqlStateStore.aclose`) should keep its own concretely-typed
+        reference — store/engine lifecycle is caller-owned by design — or
+        narrow with :func:`typing.cast` / :func:`isinstance`.
+
+        Returns:
+            The :class:`StateStore` this Runner was constructed with, by
+            identity.
+
+        (BR-011)
+        """
+        return self._state
 
     async def _emit_audit(
         self,
