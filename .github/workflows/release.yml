@@ -6,14 +6,64 @@ name: release
 # PyPI-side config (one-time, done by the project owner):
 #   Trusted Publisher → owner: fiftynotai, repo: fifty-agent-sdk,
 #   workflow: release.yml, environment: pypi.
+#
+# DO NOT rename this file, and do not change `environment: pypi` or the
+# `permissions: id-token: write` block. PyPI's Trusted Publisher registration
+# keys off the workflow FILENAME and the ENVIRONMENT NAME, so changing either
+# breaks publishing in a way no dry run can catch — a dry run never reaches the
+# OIDC exchange (TD-008).
+#
+# DRY RUN (TD-008). `workflow_dispatch` runs everything except the publish
+# step: build → checksum → upload → download → `Verify artifact round-trip`.
+# The guard sits on the publish STEP, never on the publish JOB, because
+# download-artifact lives inside that job — guarding the job would skip the
+# artifact round-trip, which is the only thing the dry run exists to prove.
+#
+# The dispatch is a pre-flight for any release, and it is REQUIRED before
+# merging a bump to actions/upload-artifact or actions/download-artifact.
+# Those two run ONLY here, and this workflow has no `pull_request` trigger, so
+# they execute ZERO times on a PR: a green CI is not evidence about them.
+# (Three of the five actions in this workflow run zero times on a PR — both
+# artifact actions and the publisher. PR #19 was green on all three Pythons,
+# and two of its four bumps were among them. That is the whole of TD-008.)
+#
+# PRECONDITION for the first dispatch after ANY change to the guard below: the
+# version in pyproject.toml must be one already published on PyPI. Then, if the
+# guard is wrong and the publish step fires anyway, PyPI rejects the upload as a
+# duplicate and no version is burned. NEVER first-dispatch a modified guard
+# while pyproject declares an unpublished version — a PyPI version cannot be
+# reused.
+#
+# pypa/gh-action-pypi-publish stays pinned to the moving `@release/v1` branch
+# (TD-008), and this is a local decision, not an upstream endorsement: that
+# project's README now explicitly pro-tips pinning to a tagged version or a
+# sha1 commit instead of a branch pointer. We deliberately do not, here,
+# because (a) no mechanism this repo controls can validate a change to this
+# action — validating it means publishing to a real index, so a bump would land
+# on hope, which is exactly what this workflow's dry run exists to abolish; and
+# (b) this action is the OIDC client for PyPI Trusted Publishing and
+# `release/v1` is where fixes tracking PyPI server-side changes ship, so
+# freezing it trades a supply-chain risk for a liveness risk in the publish
+# path — a stale pin fails mid-release, on a tag already pushed. Pinning it
+# belongs to the SHA-pinning decision deliberately deferred in
+# .github/dependabot.yml (see the "KNOW WHAT THIS DOES AND DOES NOT BUY" block
+# above the github-actions ecosystem entry): worth doing across all five actions
+# as its own change, not on the single action where the liveness cost is highest.
 
 on:
   push:
     tags: ["v*"]
+  # TD-008: manual dry run. Publishes nothing — see the header and the guard on
+  # the publish step. Only visible in the Actions UI once this workflow is on
+  # the default branch.
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      # Consumed by the publish job's round-trip verification (TD-008).
+      dist-sha256: ${{ steps.checksums.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v5
 
@@ -30,6 +80,23 @@ jobs:
         run: |
           python -m pip install twine
           twine check dist/*
+
+      # TD-008: record what the build produced, so the publish job can prove the
+      # bytes it downloaded are the bytes that were uploaded — not merely that
+      # the download step was green.
+      - name: Record artifact checksums
+        id: checksums
+        run: |
+          sha256sum dist/* | sort
+          # `| sort` on BOTH sides (see the publish job's verify step) so the
+          # comparison cannot depend on the two jobs' shells collating dist/*
+          # identically. They would — same image, ASCII filenames — but these
+          # are separate VMs and a spurious mismatch here aborts a real release.
+          {
+            echo 'sha256<<EOF'
+            sha256sum dist/* | sort
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -49,5 +116,33 @@ jobs:
           name: dist
           path: dist/
 
+      - name: Verify artifact round-trip
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.dist-sha256 }}
+        run: |
+          echo "::group::downloaded layout"; ls -R dist/; echo "::endgroup::"
+          # The layout pypa/gh-action-pypi-publish consumes (packages-dir: dist/).
+          # A download-artifact major that nests a named artifact under
+          # path/<name> would land these at dist/dist/ and the publish step
+          # would silently match nothing. Fail loudly here instead.
+          test ! -e dist/dist
+          ls dist/*.whl dist/*.tar.gz > /dev/null
+          printf '%s\n' "$EXPECTED_SHA256" > expected.sha256
+          sha256sum dist/* | sort > actual.sha256
+          diff -u expected.sha256 actual.sha256
+          # No `twine check` here, deliberately. The build job already ran it on
+          # these exact files, and the diff above proves the bytes are unchanged
+          # — checksum identity is strictly stronger evidence than re-running the
+          # same check on the same bytes. Omitting it also keeps this job free of
+          # any `python` dependency: `publish` has no setup-python step, so a
+          # `python -m pip install twine` here would rest on the bare runner
+          # image providing python and permitting a system-wide install (PEP 668)
+          # — an untested assumption newly introduced into the release path.
+
       - name: Publish to PyPI (Trusted Publishing)
+        # TD-008: a workflow_dispatch run exercises build + the full artifact
+        # round-trip and stops here. Both clauses are false on a dispatch and
+        # both are true on the tag push that is this workflow's only other
+        # trigger, so release behaviour is unchanged.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: pypa/gh-action-pypi-publish@release/v1

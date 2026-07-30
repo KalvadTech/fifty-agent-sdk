@@ -7,9 +7,10 @@
 # opens that proposal as a PR, which runs the same four-command gate the pin
 # protects — so every bump is validated by the thing it might break.
 #
-# Deliberately NOT covered here: the `github-actions` ecosystem. The workflow
-# action pins (actions/checkout@v5, actions/setup-python@v6) are a real but
-# separate exposure and belong to their own change, not to TD-004.
+# The `github-actions` ecosystem WAS deliberately excluded when this file was
+# written for TD-004, then added by TD-007 once the dependency graph revealed
+# five previously-invisible action pins. See that ecosystem's own block below
+# for what it does and does not buy.
 #
 # VERIFY REGISTRATION, once, after this lands: repo -> Insights -> Dependency
 # graph -> Dependabot should list this manifest. If it does not detect the PEP
@@ -83,13 +84,30 @@ updates:
   # supply-chain surface for the released artifact (TD-007; TD-004 deferred this
   # deliberately, and the dependency graph now confirms all five are visible).
   #
-  # KNOW WHAT THIS DOES AND DOES NOT BUY. Everything is pinned to a floating
-  # major tag (@v5, @v6, @v4) or, for the publish step, a BRANCH (@release/v1).
-  # Dependabot bumps v5 -> v6 when a new major ships. It does NOT protect against
-  # the upstream owner re-pointing an existing tag or branch at new code, which is
+  # KNOW WHAT THIS DOES AND DOES NOT BUY. Every action is pinned to a floating
+  # MAJOR TAG, or — for the publish step — a BRANCH (@release/v1). Dependabot
+  # proposes the next major when one ships. It does NOT protect against the
+  # upstream owner re-pointing an existing tag or branch at new code, which is
   # the actual attack. Only SHA pinning does that, at the cost of readability and
   # of relying on Dependabot to keep the SHAs current. That is a separate
   # decision and is deliberately NOT taken here.
+  #
+  # Deliberately no specific versions in this comment: TD-008 moved all four
+  # bumpable pins in one change, and an earlier version of this block went stale
+  # the moment it did. The pins live in the workflows; naming them twice just
+  # creates a second thing to forget.
+  #
+  # ONE ACTION IS INVISIBLE TO EVERYTHING BELOW. pypa/gh-action-pypi-publish
+  # matches `*`, but it is pinned to a BRANCH (@release/v1), and a branch is not
+  # a version — there is no "newer branch" for Dependabot to propose, so it will
+  # never appear in either group. That is a deliberate resting place, not an
+  # oversight (TD-008): no mechanism this repo controls can validate a change to
+  # that action, since validating it means publishing to a real index. Upstream
+  # now pro-tips pinning to a tag or sha1 rather than a branch pointer, so this
+  # pin is a local judgement and not an upstream recommendation — see the
+  # reasoning in .github/workflows/release.yml's header. It belongs to the
+  # SHA-pinning decision deferred just above, taken across all five actions or
+  # not at all.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -99,6 +117,36 @@ updates:
     commit-message:
       prefix: "chore"
     groups:
-      github-actions:
+      # TD-008. Dependabot CANNOT group by consuming workflow: group
+      # selectors are patterns over the ACTION NAME (plus dependency-type /
+      # update-types), and the github-actions ecosystem scans every file in
+      # .github/workflows from directory "/". The split below is by name and
+      # only reproduces the risk boundary because, today, the two artifact
+      # actions appear ONLY in release.yml.
+      #
+      # ADDING A NEW release.yml-ONLY ACTION REQUIRES **TWO** EDITS BY HAND:
+      # add it to publish-path-actions' `patterns` AND to ci-validated-actions'
+      # `exclude-patterns`. Doing only the first is a silent no-op — groups are
+      # matched in DECLARATION ORDER, so the `"*"` below claims the dependency
+      # first and it arrives in the CI-validated group, disguised as a
+      # CI-green PR. That is precisely the failure TD-008 exists to prevent,
+      # so getting this half-right is worse than not splitting at all.
+      ci-validated-actions:
+        patterns: ["*"]
+        exclude-patterns:
+          - "actions/upload-artifact"
+          - "actions/download-artifact"
+      publish-path-actions:
+        # These two run ONLY in release.yml, which triggers on a version tag.
+        # A green CI on their bump PR executes them ZERO times, so it is not
+        # evidence (TD-008; PR #19 was green and proved nothing about them).
+        # REQUIRED before merging one of these: run release.yml via
+        # workflow_dispatch on the PR branch and confirm the "Verify artifact
+        # round-trip" step passes. Grouped together deliberately — build
+        # uploads and publish downloads, so the two must stay compatible; the
+        # group keeps both ends of that wire in one diff. It does NOT force
+        # lockstep: if only one has a new major that week, the PR carries one,
+        # and it is the reviewer who must check the pairing.
         patterns:
-          - "*"
+          - "actions/upload-artifact"
+          - "actions/download-artifact"
