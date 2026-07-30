@@ -113,6 +113,22 @@ the llm client. a protocol plus an openai-compatible adapter, so the loop talks 
 
 the state stores. where conversation state persists between turns, with branching built in: fork a session, switch between branches, truncate back to an earlier point. `MemoryStateStore` needs no infrastructure; `SqlStateStore` and `RedisStateStore` are durable backends behind the extras.
 
+a runner hands back the store it was built with as `runner.state`, so the branching calls above are reachable from a runner you already have:
+
+```python
+store = MemoryStateStore()
+runner = AgentRunner(loop=..., state=store)
+
+runner.state is store  # True — the exact instance, never a copy or a wrapper
+branch = await runner.state.fork(session_id, from_sequence=4)
+```
+
+identity is the point rather than convenience: a second store constructed over the same engine carries its own lock registry, so two writers could interleave on one session. sharing `runner.state` shares the serialization too.
+
+it is read-only, for correctness and not for style. `run()` appends the user message, drives the loop, then appends the assistant message — a store swapped in between those appends would split one turn across two backends. assignment raises `AttributeError`, and mypy rejects it statically. to use a different store, construct another runner; `__init__` does no i/o. the declared type is the `StateStore` protocol, so keep your own concretely-typed reference if you need backend-specific api like `SqlStateStore.aclose()`.
+
+`runner.state` is the supported way in. `_state` is private, carries no semver protection, and may be renamed or removed in a patch release.
+
 ### streaming
 
 a typed event stream the caller consumes while the loop runs. each step in the run surfaces as an event instead of waiting for a final blob.
