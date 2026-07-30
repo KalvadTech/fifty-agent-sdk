@@ -42,3 +42,30 @@ updates:
           - "pytest*"
           - "aiosqlite"
           - "fakeredis"
+
+    # A capped requirement reads to Dependabot as staleness to be fixed: it sees
+    # the ceiling, sees a version above it, and proposes relaxing the cap. It
+    # cannot tell a stale guess from a deliberate constraint. These two ceilings
+    # are deliberate, so the major bump is ignored here — the minors and patches
+    # BELOW each ceiling still flow (TD-005).
+    #
+    # Do NOT add the dev-extra `==` pins here. Proposing a bump past an exact pin
+    # is the whole mechanism TD-004 installed; ignoring those would switch it off.
+    #
+    # Remove an entry only when the SDK has actually migrated to that major — at
+    # which point the pyproject ceiling moves in the same PR, and this entry is
+    # what should have stopped that happening by accident.
+    ignore:
+      # mcp 2.0.0 is a migration, not a bump — proven by CI on the closed PR #15
+      # (red on all three Pythons): McpError REMOVED; inputSchema / isError /
+      # structuredContent renamed to snake_case; streamable_http_client yields 2
+      # values instead of 3 and wants an httpx2 client. Relaxing this would let a
+      # consumer resolve mcp 2.x against an SDK that cannot work with it. See the
+      # dependency's own comment in pyproject.toml — re-probe the live API first.
+      - dependency-name: "mcp"
+        update-types: ["version-update:semver-major"]
+      # openai <3.0.0 predates TD-005 and was set against observed drift. Same
+      # reasoning, not yet stress-tested: openai 3.x does not exist yet, so this
+      # entry is pre-emptive rather than CI-proven.
+      - dependency-name: "openai"
+        update-types: ["version-update:semver-major"]
