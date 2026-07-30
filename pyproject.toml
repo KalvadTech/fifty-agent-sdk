@@ -85,8 +85,8 @@ dev = [
     # the ceiling never engages. A minor ceiling stays patch-permissive and
     # puts the next minor in front of a reviewer with CI attached.
     "pytest-httpx>=0.30.0,<0.37.0",
-    "ruff==0.15.18",
-    "mypy==2.1.0",
+    "ruff==0.16.0",
+    "mypy==2.3.0",
     "aiosqlite>=0.19.0,<0.23.0",
     # fakeredis must track the redis major version (redis>=5.0.0 above):
     # the SDK relies on 5.x async semantics — aclose(), pipeline(transaction=True).
