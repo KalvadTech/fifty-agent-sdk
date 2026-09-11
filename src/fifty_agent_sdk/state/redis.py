@@ -46,7 +46,10 @@ TTL semantics
     :meth:`RedisStateStore.fork` re-issues ``EXPIRE`` on the ``:branches``
     registry hash it creates or extends. When ``ttl_seconds`` is
     ``None`` no ``EXPIRE`` is ever issued and the session is durable until
-    :meth:`delete`. :meth:`get_messages` NEVER sets or refreshes a TTL —
+    :meth:`delete`. A non-positive ``ttl_seconds`` is rejected with
+    :class:`ValueError` at construction: ``EXPIRE`` with ``0`` deletes a key
+    immediately, so accepting it would wipe every session key on the first
+    append. :meth:`get_messages` NEVER sets or refreshes a TTL —
     reading a session does not keep it alive.
 
 Atomicity
@@ -260,7 +263,15 @@ class RedisStateStore:
                 on each write. When ``None`` (the default), no ``EXPIRE``
                 is ever issued and the session list is durable until
                 :meth:`delete`.
+
+        Raises:
+            ValueError: If ``ttl_seconds`` is not positive. ``EXPIRE``
+                with a non-positive value deletes a key immediately, so
+                accepting ``0`` or less would wipe every session key on
+                the first append.
         """
+        if ttl_seconds is not None and ttl_seconds <= 0:
+            raise ValueError(f"ttl_seconds must be a positive integer or None, got {ttl_seconds!r}")
         # ``decode_responses=True`` makes list members come back as ``str``
         # (rather than ``bytes``), ready to hand straight to
         # ``ChatMessage.model_validate_json``.

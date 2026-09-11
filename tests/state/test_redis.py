@@ -325,6 +325,18 @@ async def test_fork_applies_ttl_to_branches_registry(
     assert 0 < ttl <= 3600
 
 
+def test_non_positive_ttl_seconds_rejected() -> None:
+    """``ttl_seconds <= 0`` raises at construction instead of deleting data.
+
+    Regression: the check was ``is not None``, so ``ttl_seconds=0`` issued
+    ``EXPIRE 0`` inside the append transaction — deleting every session key
+    on the first append.
+    """
+    for bad in (0, -1, -3600):
+        with pytest.raises(ValueError, match="positive integer or None"):
+            RedisStateStore("redis://localhost:6379/0", ttl_seconds=bad)
+
+
 # ---------------------------------------------------------------------------
 # Error wrapping
 # ---------------------------------------------------------------------------
