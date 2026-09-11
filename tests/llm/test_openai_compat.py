@@ -793,6 +793,43 @@ async def test_stream_malformed_chunk_raises_llm_error(httpx_mock: HTTPXMock) ->
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle: aclose() and the async context manager
+# ---------------------------------------------------------------------------
+
+
+async def test_aclose_closes_owned_client() -> None:
+    """An owned client (no injected http_client) is closed by aclose()."""
+    client = _make_client()
+    await client.aclose()
+    assert client._client.is_closed()
+
+
+async def test_aclose_is_idempotent() -> None:
+    """A second ``aclose()`` is a no-op and MUST NOT raise."""
+    client = _make_client()
+    await client.aclose()
+    await client.aclose()
+    assert client._client.is_closed()
+
+
+async def test_aclose_does_not_close_injected_http_client() -> None:
+    """An injected ``http_client`` stays open after aclose() — the caller owns it."""
+    injected = httpx.AsyncClient()
+    client = _make_client(http_client=injected)
+    await client.aclose()
+    assert not injected.is_closed
+    await injected.aclose()
+
+
+async def test_async_context_manager_closes_owned_client_on_exit() -> None:
+    """``async with`` returns the client itself and aclose()s it on exit."""
+    async with _make_client() as client:
+        assert isinstance(client, OpenAICompatibleClient)
+        assert not client._client.is_closed()
+    assert client._client.is_closed()
+
+
+# ---------------------------------------------------------------------------
 # Protocol conformance
 # ---------------------------------------------------------------------------
 

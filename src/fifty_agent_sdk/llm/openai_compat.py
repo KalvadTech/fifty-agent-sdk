@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from types import TracebackType
 from typing import Any
 
 import httpx
@@ -58,6 +59,13 @@ class OpenAICompatibleClient:
     Provider variation is absorbed by ``base_url`` — the same client class
     drives OpenAI itself, GDC, and local OSS servers.
 
+    Async context management
+        The client is an async context manager: ``async with
+        OpenAICompatibleClient(...) as client:`` closes the underlying
+        connection pool on exit via :meth:`aclose`. Without the context
+        manager, call :meth:`aclose` explicitly — an unclosed client leaks
+        its ``httpx.AsyncClient`` pool until GC.
+
     Args:
         api_key: API key passed to the upstream provider. Required even for
             local servers that ignore it; pass any non-empty string.
@@ -71,7 +79,11 @@ class OpenAICompatibleClient:
             errors surface immediately, which is what tests want.
         http_client: Optional pre-configured ``httpx.AsyncClient``. Useful for
             tests that need to inject a mock transport. When omitted, the
-            SDK builds its own client.
+            SDK builds its own client, OWNS it, and closes it on
+            :meth:`aclose`. An INJECTED client is NOT closed by
+            :meth:`aclose` — its lifecycle belongs to the caller. This
+            owned-vs-injected discipline mirrors
+            :class:`fifty_agent_sdk.mcp.client.MCPClient`.
     """
 
     def __init__(
@@ -95,6 +107,39 @@ class OpenAICompatibleClient:
             kwargs["http_client"] = http_client
         self._client = AsyncOpenAI(**kwargs)
         self._default_model = model
+        # Ownership discipline mirrors MCPClient: an injected http_client is
+        # the caller's to close; only the client built here is closed by
+        # aclose(). (`AsyncOpenAI.close()` closes the underlying httpx client
+        # unconditionally, so it must only be called on the owned path.)
+        self._owns_client = http_client is None
+        self._closed = False
+
+    async def aclose(self) -> None:
+        """Close the underlying ``openai`` client and its connection pool.
+
+        Only an OWNED client is closed: when ``http_client`` was injected at
+        construction, its lifecycle belongs to the caller and ``aclose()``
+        leaves it open. Idempotent: a second ``aclose()`` is a no-op and does
+        NOT raise. The client MUST NOT be used after ``aclose()`` returns.
+        """
+        if self._closed:
+            return
+        if self._owns_client:
+            await self._client.close()
+        self._closed = True
+
+    async def __aenter__(self) -> OpenAICompatibleClient:
+        """Enter the async context manager, returning ``self``."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the async context manager, closing via :meth:`aclose`."""
+        await self.aclose()
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
         """Run a single non-streaming completion.
