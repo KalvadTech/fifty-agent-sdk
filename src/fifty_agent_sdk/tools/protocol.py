@@ -38,7 +38,13 @@ class ToolSchema(BaseModel):
         properties: Mapping of parameter name to its JSON-Schema description.
             Pydantic's ``model_json_schema()`` populates this when the schema
             is derived from a function signature (see
-            :func:`fifty_agent_sdk.tools.inproc_provider.tool`).
+            :func:`fifty_agent_sdk.tools.inproc_provider.tool`). Local
+            ``#/$defs/...`` references are INLINED by the providers before the
+            schema is emitted (see
+            :mod:`fifty_agent_sdk.tools._schema_refs`) — the dict must be
+            self-contained because the loop ships it into provider
+            function-calling envelopes that reject unknown top-level keys, so
+            a ``$defs`` block cannot ride along.
         required: Names of parameters without defaults. Pydantic's schema
             emitter populates this automatically.
         additionalProperties: Always ``False`` — the schema is the complete

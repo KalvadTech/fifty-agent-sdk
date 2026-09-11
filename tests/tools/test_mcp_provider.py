@@ -91,19 +91,124 @@ def test_schema_translation_identity() -> None:
     assert schema.additionalProperties is False
 
 
-def test_schema_translation_drops_unknown_top_level_keys() -> None:
+def _collect_refs(node: Any) -> list[str]:
+    """Recursively collect every ``$ref`` value in a schema structure."""
+    refs: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                refs.append(value)
+            else:
+                refs.extend(_collect_refs(value))
+    elif isinstance(node, list):
+        for item in node:
+            refs.extend(_collect_refs(item))
+    return refs
+
+
+def test_schema_translation_inlines_defs_and_drops_unknown_top_level_keys() -> None:
+    """``$defs`` is not just dropped: local ``#/$defs/...`` refs are inlined
+    first, so no dangling pointer reaches the LLM-facing schema. Other unknown
+    top-level keys (``examples``, …) are still silently dropped — ToolSchema is
+    ``extra="forbid"``."""
     schema = _to_tool_schema(
         {
             "type": "object",
-            "properties": {},
-            "required": [],
-            "$defs": {"X": {"type": "object"}},
+            "properties": {"addr": {"$ref": "#/$defs/Address"}},
+            "required": ["addr"],
+            "$defs": {
+                "Address": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                }
+            },
             "examples": [{}],
         }
     )
-    # No KeyError; ToolSchema is extra="forbid" so we silently drop the
-    # unknown top-level keys at translation time.
     assert schema.type == "object"
+    assert _collect_refs(schema.properties) == []
+    addr = schema.properties["addr"]
+    assert addr["type"] == "object"
+    assert addr["properties"]["city"] == {"type": "string"}
+    assert addr["required"] == ["city"]
+    assert schema.required == ["addr"]
+
+
+def test_schema_translation_inlines_nested_defs_recursively() -> None:
+    """A def that itself refs another def must resolve to full depth."""
+    schema = _to_tool_schema(
+        {
+            "type": "object",
+            "properties": {"order": {"$ref": "#/$defs/Order"}},
+            "$defs": {
+                "Order": {
+                    "type": "object",
+                    "properties": {"shipping": {"$ref": "#/$defs/Address"}},
+                },
+                "Address": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    )
+    assert _collect_refs(schema.properties) == []
+    shipping = schema.properties["order"]["properties"]["shipping"]
+    assert shipping["properties"]["city"] == {"type": "string"}
+
+
+def test_schema_translation_ref_sibling_keys_are_preserved() -> None:
+    """Sibling keys next to a ``$ref`` (JSON Schema 2020-12 conjunctive
+    semantics) are merged over the resolved definition, not discarded."""
+    schema = _to_tool_schema(
+        {
+            "type": "object",
+            "properties": {"addr": {"$ref": "#/$defs/Address", "description": "where"}},
+            "$defs": {"Address": {"type": "object", "properties": {}}},
+        }
+    )
+    addr = schema.properties["addr"]
+    assert addr["description"] == "where"
+    assert addr["type"] == "object"
+
+
+def test_schema_translation_leaves_unresolvable_refs_untouched() -> None:
+    """A ref the resolver cannot resolve locally (missing def, external URI)
+    passes through — inlining must not invent information the server schema
+    did not carry."""
+    schema = _to_tool_schema(
+        {
+            "type": "object",
+            "properties": {
+                "x": {"$ref": "#/$defs/Missing"},
+                "y": {"$ref": "https://schemas.example.com/ext"},
+            },
+        }
+    )
+    assert schema.properties["x"]["$ref"] == "#/$defs/Missing"
+    assert schema.properties["y"]["$ref"] == "https://schemas.example.com/ext"
+
+
+def test_schema_translation_defs_cycle_falls_back_to_empty_schema() -> None:
+    """A cyclic server schema (a def that transitively refs itself) has no
+    finite inline expansion; untrusted server data takes the same defensive
+    fallback as a non-object schema rather than aborting discovery."""
+    schema = _to_tool_schema(
+        {
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/Node"}},
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {"child": {"$ref": "#/$defs/Node"}},
+                }
+            },
+        }
+    )
+    assert schema.type == "object"
+    assert schema.properties == {}
+    assert schema.required == []
 
 
 def test_schema_translation_falls_back_for_non_object_top_level() -> None:
