@@ -16,7 +16,8 @@ commitments from BR-010:
 * Idempotent delete; delete is scoped to one session.
 * The configured ``key_prefix`` is applied (default ``fifty_agent_sdk:state:``).
 * TTL is *set* on append when ``ttl_seconds`` is configured, refreshed on
-  every append, and absent when ``ttl_seconds`` is ``None``.
+  every append, applied by ``switch_branch``/``fork`` to the keys they
+  create, and absent when ``ttl_seconds`` is ``None``.
 * Every backend failure (:class:`redis.exceptions.RedisError`) is wrapped
   into :class:`StateStoreError` with the documented context shape.
 * :class:`RedisStateStore` satisfies the :class:`StateStore` protocol.
@@ -271,6 +272,57 @@ async def test_no_ttl_when_ttl_seconds_is_none(store: RedisStateStore) -> None:
     # Redis returns -1 for a key that exists but has no associated expiry.
     ttl = await store._client.ttl("fifty_agent_sdk:state:s1")
     assert ttl == -1
+
+
+async def test_switch_branch_applies_ttl_to_active_pointer(
+    store_with_ttl: RedisStateStore,
+) -> None:
+    """``switch_branch`` must not leave the ``:active`` pointer without a TTL.
+
+    Regression: the pointer was written with a bare ``SET``, which both
+    stripped any TTL the key already carried and left a first-time key with
+    none — so the active head could outlive the session it belongs to.
+    """
+    await store_with_ttl.append("s1", ChatMessage(role="user", content="a"))
+    branch = await store_with_ttl.fork("s1", from_sequence=1)
+    await store_with_ttl.switch_branch("s1", branch)
+    ttl = await store_with_ttl._client.ttl("fifty_agent_sdk:state:s1:active")
+    assert 0 < ttl <= 3600
+    # Switching back re-applies the TTL just the same.
+    await store_with_ttl.switch_branch("s1", "trunk")
+    ttl = await store_with_ttl._client.ttl("fifty_agent_sdk:state:s1:active")
+    assert 0 < ttl <= 3600
+
+
+async def test_switch_branch_without_ttl_leaves_pointer_durable(
+    store: RedisStateStore,
+) -> None:
+    """With ``ttl_seconds=None`` the ``:active`` pointer gets no expiry."""
+    await store.append("s1", ChatMessage(role="user", content="a"))
+    branch = await store.fork("s1", from_sequence=1)
+    await store.switch_branch("s1", branch)
+    ttl = await store._client.ttl("fifty_agent_sdk:state:s1:active")
+    assert ttl == -1
+
+
+async def test_fork_applies_ttl_to_branches_registry(
+    store_with_ttl: RedisStateStore,
+) -> None:
+    """Forking a pre-BR-004 session gives the new ``:branches`` hash the TTL.
+
+    Regression: the registry hash was created via HSETNX/HSET with no
+    ``EXPIRE``, so forking a legacy single-list session (whose bare list
+    predates the registry) left the registry durable while the rest of the
+    session expired.
+    """
+    # Pre-BR-004 layout: a bare message list with no registry hash.
+    await store_with_ttl._client.rpush(
+        "fifty_agent_sdk:state:legacy",
+        ChatMessage(role="user", content="old").model_dump_json(),
+    )
+    await store_with_ttl.fork("legacy", from_sequence=1)
+    ttl = await store_with_ttl._client.ttl("fifty_agent_sdk:state:legacy:branches")
+    assert 0 < ttl <= 3600
 
 
 # ---------------------------------------------------------------------------

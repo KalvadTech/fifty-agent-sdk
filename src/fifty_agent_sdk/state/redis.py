@@ -39,7 +39,12 @@ TTL semantics
     ``EXPIRE`` across ALL of the session's keys (trunk, every fork list, the
     registry, and the active pointer) so the whole session's expiry window
     slides forward together — a "hot session stays alive" cache, and a fork's
-    parent line never expires out from under it. When ``ttl_seconds`` is
+    parent line never expires out from under it. The two branch-write paths
+    honour the same TTL: :meth:`RedisStateStore.switch_branch` writes the
+    ``:active`` pointer with ``SET ... EX`` (a bare ``SET`` would strip any
+    existing TTL, and a first switch creates the key with none), and
+    :meth:`RedisStateStore.fork` re-issues ``EXPIRE`` on the ``:branches``
+    registry hash it creates or extends. When ``ttl_seconds`` is
     ``None`` no ``EXPIRE`` is ever issued and the session is durable until
     :meth:`delete`. :meth:`get_messages` NEVER sets or refreshes a TTL —
     reading a session does not keep it alive.
@@ -176,8 +181,11 @@ class RedisStateStore:
     TTL model:
         With a positive ``ttl_seconds`` every :meth:`append` slides the
         session's expiry window forward (``EXPIRE`` re-issued on each
-        write) — a hot-session cache. With ``ttl_seconds=None`` the list
-        never expires. :meth:`get_messages` never touches the TTL.
+        write) — a hot-session cache. :meth:`switch_branch` and
+        :meth:`fork` apply the same TTL to the keys they create (the
+        ``:active`` pointer and the ``:branches`` registry). With
+        ``ttl_seconds=None`` the list never expires.
+        :meth:`get_messages` never touches the TTL.
 
     Atomicity:
         :meth:`append` runs ``RPUSH`` + ``EXPIRE`` in a single
@@ -607,7 +615,10 @@ class RedisStateStore:
 
         Records a new entry in the branch-registry hash whose parent is the
         active branch. The new branch's own list is created lazily on its
-        first :meth:`append`. Does NOT change the active head.
+        first :meth:`append`. Does NOT change the active head. When
+        ``ttl_seconds`` is configured, the registry hash — which this method
+        may have just created — gets the session TTL re-applied so it expires
+        with the rest of the session's keys.
 
         Raises:
             ValueError: If the session is unknown, or ``from_sequence`` is
@@ -639,6 +650,15 @@ class RedisStateStore:
                 }
             )
             await cast("Any", self._client.hset(self._branches_key(session_id), new_id, meta))
+            # The registry hash is created here (via _ensure_trunk / this HSET)
+            # with no TTL of its own — e.g. when forking a pre-BR-004 session
+            # whose bare list predates the registry. Re-apply the session TTL so
+            # the registry expires with the rest of the session's keys.
+            if self._ttl_seconds is not None:
+                await cast(
+                    "Any",
+                    self._client.expire(self._branches_key(session_id), self._ttl_seconds),
+                )
             _log.debug("redis_state_store.fork", session_id=session_id, branch_id=new_id)
             return new_id
         except RedisError as exc:
@@ -690,6 +710,11 @@ class RedisStateStore:
     async def switch_branch(self, session_id: str, branch_id: str) -> None:
         """Set the session's active head to ``branch_id``.
 
+        When ``ttl_seconds`` is configured the ``:active`` pointer is written
+        with ``SET ... EX <ttl>``: a bare ``SET`` would strip any TTL the key
+        already carried, and a first switch creates the key with none — either
+        way the pointer would outlive the session it belongs to.
+
         Raises:
             ValueError: If ``branch_id`` does not exist for this session.
             fifty_agent_sdk.errors.StateStoreError: On backend failure.
@@ -704,7 +729,11 @@ class RedisStateStore:
                 raise ValueError(
                     f"branch_id={branch_id!r} does not exist for session {session_id!r}"
                 )
-            await cast("Any", self._client.set(self._active_key(session_id), branch_id))
+            ttl = self._ttl_seconds
+            if ttl is not None:
+                await cast("Any", self._client.set(self._active_key(session_id), branch_id, ex=ttl))
+            else:
+                await cast("Any", self._client.set(self._active_key(session_id), branch_id))
             _log.debug(
                 "redis_state_store.switch_branch", session_id=session_id, branch_id=branch_id
             )
