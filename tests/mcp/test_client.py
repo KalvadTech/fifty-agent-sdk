@@ -16,6 +16,7 @@ fifty-agent-sdk-facing contract the wrapper still owns:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -263,6 +264,54 @@ async def test_invalid_auth_callable_return_raises_mcp_error() -> None:
         await client.invoke("x", {})
     assert exc.value.context["wrapped"] == "str"
     assert mock.observed_requests == [], "auth must fail before any request"
+
+
+async def test_raising_auth_callable_raises_mcp_error() -> None:
+    """A RAISING auth callable (e.g. token endpoint down) surfaces as MCPError.
+
+    Regression: a bad return TYPE was already validated into MCPError, but an
+    auth callable that raised propagated the raw exception — past the
+    "returns or raises MCPError" contract and into the Registry's
+    non-``AgentSdkError`` branch, which downgrades it to a model-recoverable
+    ``ToolResult(is_error=True)`` instead of the fatal failure it is. The
+    exception TEXT must not leak into the MCPError (an auth error message may
+    carry credential material); only the type name is captured.
+    """
+
+    def _never_called(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("transport should not be invoked")
+
+    http_client, mock = make_strict_http_client(_never_called)
+
+    async def down_token_endpoint() -> dict[str, str]:
+        raise httpx.ConnectError("https://secret-token-endpoint.internal unreachable")
+
+    client = MCPClient(_config(), auth=down_token_endpoint, client=http_client)
+    with pytest.raises(MCPError) as exc:
+        await client.invoke("x", {})
+    assert exc.value.context["wrapped"] == "ConnectError"
+    assert exc.value.context["server_url"] == MCP_URL
+    serialized = json.dumps(exc.value.context, default=str) + exc.value.message
+    assert "secret-token-endpoint" not in serialized
+    assert mock.observed_requests == [], "auth must fail before any request"
+
+
+async def test_cancelled_auth_callable_propagates_cancellation() -> None:
+    """A CancelledError out of the auth callable is NOT translated into
+    MCPError — consumer cancellation must propagate (CancelledError is a
+    BaseException on 3.11+, so the ``except Exception`` guard skips it)."""
+
+    def _never_called(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("transport should not be invoked")
+
+    http_client, _ = make_strict_http_client(_never_called)
+
+    async def cancelled_auth() -> dict[str, str]:
+        raise asyncio.CancelledError
+
+    client = MCPClient(_config(), auth=cancelled_auth, client=http_client)
+    with pytest.raises(asyncio.CancelledError):
+        await client.invoke("x", {})
 
 
 # ---------------------------------------------------------------------------

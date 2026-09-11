@@ -53,7 +53,11 @@ Error contract
     Every public method either returns successfully or raises
     :class:`MCPError`. No ``mcp`` SDK exceptions (``McpError``) and no
     ``httpx`` exceptions leak — they are unwrapped from anyio
-    ``ExceptionGroup``s and translated into :class:`MCPError`. The
+    ``ExceptionGroup``s and translated into :class:`MCPError`. An exception
+    raised by a callable ``auth`` provider (e.g. a token endpoint being down)
+    is translated the same way, with only the exception TYPE captured in
+    ``context`` — never the exception text, which may carry credential
+    material. The
     :class:`fifty_agent_sdk.tools.mcp_provider._MCPToolAdapter` deliberately does
     NOT catch :class:`MCPError` so the
     :class:`fifty_agent_sdk.tools.registry.Registry`'s ``AgentSdkError`` branch
@@ -605,7 +609,15 @@ class MCPClient:
             sensitive (used to extend redaction).
 
         Raises:
-            MCPError: When a callable provider returns a non-Mapping value.
+            MCPError: When a callable provider returns a non-Mapping value, or
+                when the callable itself raises (e.g. a token endpoint being
+                down surfacing as :class:`httpx.ConnectError`). A raising
+                callable is translated so the module's "returns or raises
+                MCPError" contract holds; without it the raw exception would
+                reach :class:`fifty_agent_sdk.tools.registry.Registry`'s
+                non-``AgentSdkError`` branch and be DOWNGRADED to a
+                model-recoverable ``ToolResult(is_error=True)`` instead of
+                staying the fatal infrastructure failure it is.
         """
         auth = self._auth
         if auth is None:
@@ -613,7 +625,29 @@ class MCPClient:
         if isinstance(auth, Mapping):
             return auth, frozenset(k.lower() for k in auth)
         # auth is a callable
-        resolved = await auth()
+        try:
+            resolved = await auth()
+        # ``except Exception`` (not bare/BaseException) keeps
+        # ``asyncio.CancelledError`` — a BaseException on 3.11+ — propagating
+        # untouched: consumer cancellation must never be re-labelled as an
+        # auth failure. This is the same classification-ordering rule the
+        # ``on_tool_error`` hook documents.
+        except Exception as exc:
+            # Type name only, never str(exc): an auth error message may echo
+            # endpoint material or credentials, and this module's standing
+            # rule is that such material never reaches an MCPError context.
+            _log.warning(
+                "mcp.auth_callable_failed",
+                server_url=self._config.base_url,
+                error_type=type(exc).__name__,
+            )
+            raise MCPError(
+                f"auth callable raised: {type(exc).__name__}",
+                context={
+                    "server_url": self._config.base_url,
+                    "wrapped": type(exc).__name__,
+                },
+            ) from exc
         if not isinstance(resolved, Mapping):
             raise MCPError(
                 "auth callable must return a Mapping[str, str]",
