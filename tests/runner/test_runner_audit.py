@@ -18,8 +18,16 @@ from __future__ import annotations
 
 import structlog
 
-from fifty_agent_sdk import AuditEvent, AuditSink, Registry, SafetyConfig, ToolResult
-from tests.loop.conftest import FakeLLMClient, FakeTool, make_response
+from fifty_agent_sdk import (
+    ActionEvent,
+    AuditEvent,
+    AuditSink,
+    Registry,
+    SafetyConfig,
+    ToolResult,
+    ToolStartedEvent,
+)
+from tests.loop.conftest import FakeLLMClient, FakeTool, make_multi_tool_response, make_response
 from tests.runner.conftest import collect, final_json, make_runner, tool_json
 
 # ---------------------------------------------------------------------------
@@ -167,6 +175,52 @@ async def test_multi_tool_run_emits_one_event_per_tool() -> None:
     assert tool_events[0].payload["args"] == {"n": 1}
     assert tool_events[1].payload["tool_name"] == "beta"
     assert tool_events[1].payload["args"] == {"n": 2}
+
+
+async def test_multi_action_batch_audits_each_call_with_own_args_and_call_id() -> None:
+    """A native MultiAction batch emits one tool_invocation per call, each with
+    its OWN args and call_id.
+
+    Regression gate for per-call correlation: the loop's MultiAction branch
+    emits N ActionEvents, then N ToolStartedEvents, then N terminal events —
+    all in call order. The old single-slot correlation gave the FIRST
+    terminal event the LAST call's call_id/args and left every other call
+    with ``args={}``. With per-call-id correlation each invocation's payload
+    carries its own pair.
+    """
+    registry = Registry()
+    registry.register(FakeTool("alpha", result=ToolResult(output="A-result")))
+    registry.register(FakeTool("beta", result=ToolResult(output="B-result")))
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("alpha", {"n": 1}), ("beta", {"n": 2})]),
+            make_response(final_json("done")),
+        ]
+    )
+    spy = SpyAuditSink()
+    runner, _store = make_runner(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=2),
+        audit=spy,
+    )
+
+    events = await collect(runner.run("s1", "Hi"))
+
+    # Sanity: this run really went through the MultiAction batch shape — two
+    # ActionEvents followed by two ToolStartedEvents.
+    actions = [e for e in events if isinstance(e, ActionEvent)]
+    started = [e for e in events if isinstance(e, ToolStartedEvent)]
+    assert len(actions) == len(started) == 2
+
+    call_id_by_tool = {e.tool_name: e.call_id for e in started}
+    tool_events = [e for e in spy.events if e.event_type == "tool_invocation"]
+    assert len(tool_events) == 2
+    by_tool = {e.payload["tool_name"]: e.payload for e in tool_events}
+    assert by_tool["alpha"]["args"] == {"n": 1}
+    assert by_tool["alpha"]["call_id"] == call_id_by_tool["alpha"]
+    assert by_tool["beta"]["args"] == {"n": 2}
+    assert by_tool["beta"]["call_id"] == call_id_by_tool["beta"]
 
 
 # ---------------------------------------------------------------------------

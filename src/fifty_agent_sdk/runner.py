@@ -106,6 +106,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -377,16 +378,20 @@ class AgentRunner:
     @staticmethod
     def _tool_invocation_payload(
         event: ObservationEvent | ToolFailedEvent,
-        pending_action: ActionEvent | None,
+        args: dict[str, Any],
         pending_call: ToolStartedEvent | None,
     ) -> dict[str, Any]:
         """Build the ``payload`` for a ``tool_invocation`` audit event.
 
-        Correlates the terminal tool event with the
-        :class:`ActionEvent` that carried the ``args`` and the
-        :class:`ToolStartedEvent` that carried the ``call_id``. The loop is
-        strictly sequential, so the single pending slots are the correct
-        pair; they are still treated as optional for robustness.
+        ``args`` and ``pending_call`` are the per-call state the event loop
+        correlated under this call's ``call_id``: ``args`` was claimed FIFO
+        from the pending :class:`ActionEvent` queue when the matching
+        :class:`ToolStartedEvent` arrived (an :class:`ActionEvent` carries
+        no ``call_id``; both the single-call branch and the ``MultiAction``
+        batch emit actions and starts in call order), and ``pending_call``
+        is the :class:`ToolStartedEvent` popped under the same key. Both
+        are already resolved per-call by the caller — this function only
+        shapes the payload.
 
         ``result_summary`` is a bounded ``repr`` of the tool's output (on
         success) or the failure string (on a recoverable failure), capped
@@ -395,8 +400,9 @@ class AgentRunner:
         Args:
             event: The :class:`ObservationEvent` or :class:`ToolFailedEvent`
                 that ended the tool call.
-            pending_action: The most recent :class:`ActionEvent`, if seen.
-            pending_call: The most recent :class:`ToolStartedEvent`, if seen.
+            args: The tool's argument dict, correlated per call; ``{}``
+                when no :class:`ActionEvent` could be claimed for the call.
+            pending_call: The correlated :class:`ToolStartedEvent`, if seen.
 
         Returns:
             The structured ``payload`` dict for the audit event.
@@ -410,7 +416,7 @@ class AgentRunner:
         return {
             "tool_name": event.tool_name,
             "call_id": (pending_call.call_id if pending_call is not None else event.call_id),
-            "args": (pending_action.args if pending_action is not None else {}),
+            "args": args,
             "outcome": outcome,
             "result_summary": result_summary,
         }
@@ -641,23 +647,25 @@ class AgentRunner:
             # coexist in the prompt; that is intentional.
             loop_messages = list(history)  # defensive copy for the loop
 
-            # Single-slot correlation for `tool_invocation` audit events.
-            # The ReACT loop is strictly sequential — one tool in flight at
-            # a time — so a single pending `ActionEvent` (carries `args`)
-            # and pending `ToolStartedEvent` (carries `call_id`) is
-            # sufficient; the paired Observation/ToolFailed clears them.
+            # Per-call correlation for `tool_invocation` audit events and the
+            # on_tool_start/on_tool_end hooks, keyed by `call_id`. The
+            # MultiAction branch of AgentLoop emits N ActionEvents, then N
+            # ToolStartedEvents, then N terminal events — all in call order —
+            # so single pending slots would mis-correlate a batch (the first
+            # terminal event would inherit the LAST call's pairing).
+            # ActionEvents carry no `call_id`, so their `args` are claimed
+            # FIFO from `pending_actions` as each ToolStartedEvent arrives
+            # (both branches emit actions and starts in call order), then
+            # stored under the started call's `call_id`. The paired terminal
+            # event pops its entry, leaving no residue. The single-call path
+            # is the N=1 case of the same flow and behaves exactly as before.
             # `last_error` holds the most recent ErrorEvent for the error
             # branch below.
-            pending_action: ActionEvent | None = None
-            pending_call: ToolStartedEvent | None = None
+            pending_actions: deque[ActionEvent] = deque()
+            pending_calls: dict[str, ToolStartedEvent] = {}
+            pending_args: dict[str, dict[str, Any]] = {}
+            tool_started_at: dict[str, float] = {}
             last_error: ErrorEvent | None = None
-            # Monotonic stamp set when a `ToolStartedEvent` is seen and
-            # diffed on the terminal tool event for the `on_tool_end`
-            # `duration_ms`. A single slot is sufficient — the ReACT loop
-            # runs one tool at a time — and it lives alongside the existing
-            # `pending_action`/`pending_call` single-slot correlation, not
-            # as a second correlation pass.
-            tool_started_at: float | None = None
 
             async for event in self._loop.run(loop_messages, session_id=session_id):
                 event_count += 1
@@ -668,37 +676,39 @@ class AgentRunner:
                     final_text = event.text
                     raw_final_completion = event.raw_completion
                 elif isinstance(event, ActionEvent):
-                    pending_action = event
+                    pending_actions.append(event)
                 elif isinstance(event, ToolStartedEvent):
-                    pending_call = event
-                    tool_started_at = time.perf_counter()
+                    action = pending_actions.popleft() if pending_actions else None
+                    pending_calls[event.call_id] = event
+                    pending_args[event.call_id] = action.args if action is not None else {}
+                    tool_started_at[event.call_id] = time.perf_counter()
                 yield event
                 # `on_tool_start` fires once the `ToolStartedEvent` is seen;
-                # `args` come from the correlated `pending_action`. Fired
-                # AFTER yielding so consumer delivery is never blocked.
+                # `args` were correlated under this call's `call_id` above.
+                # Fired AFTER yielding so consumer delivery is never blocked.
                 if isinstance(event, ToolStartedEvent):
                     await self._invoke_hook(
                         "on_tool_start",
                         session_id,
                         event.tool_name,
-                        pending_action.args if pending_action is not None else {},
+                        pending_args[event.call_id],
                     )
                 # Emit `tool_invocation` AFTER yielding so consumer event
                 # delivery is never blocked on audit latency.
                 if isinstance(event, ObservationEvent | ToolFailedEvent):
+                    pending_call = pending_calls.pop(event.call_id, None)
+                    args = pending_args.pop(event.call_id, {})
+                    started_at = tool_started_at.pop(event.call_id, None)
                     await self._emit_audit(
                         session_id,
                         "tool_invocation",
-                        self._tool_invocation_payload(event, pending_action, pending_call),
+                        self._tool_invocation_payload(event, args, pending_call),
                     )
-                    # `on_tool_end` fires beside the audit emission, BEFORE
-                    # the pending slots are cleared. `result` is the tool's
-                    # output on success or the failure string on a
-                    # recoverable failure.
+                    # `on_tool_end` fires beside the audit emission. `result`
+                    # is the tool's output on success or the failure string
+                    # on a recoverable failure.
                     tool_duration_ms = (
-                        (time.perf_counter() - tool_started_at) * 1000
-                        if tool_started_at is not None
-                        else 0.0
+                        (time.perf_counter() - started_at) * 1000 if started_at is not None else 0.0
                     )
                     tool_result = (
                         event.result.output if isinstance(event, ObservationEvent) else event.error
@@ -710,9 +720,6 @@ class AgentRunner:
                         tool_result,
                         tool_duration_ms,
                     )
-                    pending_action = None
-                    pending_call = None
-                    tool_started_at = None
 
             # ── PHASE 5: PERSIST ASSISTANT (SUCCESS PATH) ─────────────
             if not saw_error and final_text is not None:
