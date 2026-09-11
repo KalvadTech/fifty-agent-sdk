@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
 
 import httpx
@@ -93,6 +95,76 @@ async def test_discover_maps_connect_error_to_mcp_error() -> None:
         await client.discover()
     assert exc.value.context["wrapped"] == "ConnectError"
     assert exc.value.context["method"] == "tools/list"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation leaves inside exception groups (never translated to MCPError)
+# ---------------------------------------------------------------------------
+
+
+def _transport_raising(exc: BaseException) -> Any:
+    """A fake Transport whose connect() raises ``exc`` on __aenter__."""
+
+    class _FailingTransport:
+        def connect(self) -> AbstractAsyncContextManager[Any]:
+            @asynccontextmanager
+            async def _cm() -> AsyncIterator[Any]:
+                raise exc
+                yield  # pragma: no cover — unreachable; keeps this a generator
+
+            return _cm()
+
+    return _FailingTransport()
+
+
+async def test_cancelled_error_leaf_in_exception_group_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CancelledError leaf in a mixed BaseExceptionGroup is re-raised, not
+    translated into MCPError.
+
+    Regression: consumer cancellation racing a real transport error can arrive
+    as ``BaseExceptionGroup([ConnectError, CancelledError])`` out of the anyio
+    task group; translating the group wholesale surfaced
+    ``MCPError("MCP transport error: CancelledError")`` and broke the SDK's
+    cancellation contract. The race itself is impractical to stage, so the
+    mixed group is constructed directly and driven through ``discover``.
+    """
+    race = BaseExceptionGroup("race", [httpx.ConnectError("nope"), asyncio.CancelledError()])
+    client = MCPClient(_config())
+    monkeypatch.setattr(client, "_build_transport", lambda _headers: _transport_raising(race))
+    with pytest.raises(asyncio.CancelledError):
+        await client.discover()
+
+
+async def test_cancelled_error_leaf_in_nested_exception_group_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same guarantee when the CancelledError is buried one group deeper
+    (``_iter_leaf_exceptions`` flattens recursively before classification)."""
+    race = BaseExceptionGroup(
+        "outer",
+        [
+            BaseExceptionGroup("inner", [asyncio.CancelledError()]),
+            httpx.ConnectError("nope"),
+        ],
+    )
+    client = MCPClient(_config())
+    monkeypatch.setattr(client, "_build_transport", lambda _headers: _transport_raising(race))
+    with pytest.raises(asyncio.CancelledError):
+        await client.invoke("search", {"q": "x"})
+
+
+async def test_pure_exception_group_still_translates_to_mcp_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group whose leaves are all plain Exceptions still maps to MCPError."""
+    group = ExceptionGroup("transport", [httpx.ConnectError("nope"), httpx.ReadTimeout("slow")])
+    client = MCPClient(_config())
+    monkeypatch.setattr(client, "_build_transport", lambda _headers: _transport_raising(group))
+    with pytest.raises(MCPError) as exc:
+        await client.discover()
+    assert exc.value.context["wrapped"] == "ConnectError"
 
 
 # ---------------------------------------------------------------------------

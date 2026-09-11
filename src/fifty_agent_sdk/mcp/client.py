@@ -57,7 +57,10 @@ Error contract
     raised by a callable ``auth`` provider (e.g. a token endpoint being down)
     is translated the same way, with only the exception TYPE captured in
     ``context`` — never the exception text, which may carry credential
-    material. The
+    material. Cancellation is never translated: a
+    :class:`asyncio.CancelledError` propagates untouched, including when it
+    arrives as a leaf of a mixed ``BaseExceptionGroup`` (cancellation racing
+    a real transport error inside the anyio task group). The
     :class:`fifty_agent_sdk.tools.mcp_provider._MCPToolAdapter` deliberately does
     NOT catch :class:`MCPError` so the
     :class:`fifty_agent_sdk.tools.registry.Registry`'s ``AgentSdkError`` branch
@@ -443,6 +446,10 @@ class MCPClient:
                 or server-returned JSON-RPC error. Also raised with
                 ``message == "MCP client is closed"`` when invoked after
                 :meth:`aclose`.
+            asyncio.CancelledError: Propagates untouched — including when it
+                arrives as a leaf of a mixed anyio ``BaseExceptionGroup``
+                (cancellation racing a real transport error). See
+                :meth:`_mcp_error_from_transport`.
         """
         if self._closed:
             raise MCPError(
@@ -517,6 +524,10 @@ class MCPClient:
                 :meth:`aclose`. A per-call ``isError=True`` result no longer
                 raises — it is returned as a :class:`_MCPCallError` (see
                 ``Returns``).
+            asyncio.CancelledError: Propagates untouched — including when it
+                arrives as a leaf of a mixed anyio ``BaseExceptionGroup``
+                (cancellation racing a real transport error). See
+                :meth:`_mcp_error_from_transport`.
         """
         if self._closed:
             raise MCPError(
@@ -727,8 +738,24 @@ class MCPClient:
         (e.g. an ``initialize`` protocol-version failure raised inside the
         task group) is routed through the session mapping. Never carries
         headers.
+
+        Cancellation — re-raised, never translated:
+            A leaf that is a :class:`BaseException` but NOT an
+            :class:`Exception` (:class:`asyncio.CancelledError`,
+            :class:`KeyboardInterrupt`) is re-raised untouched. Such a leaf
+            is reachable when consumer cancellation races a real transport
+            error inside the anyio task group and both arrive wrapped in one
+            ``BaseExceptionGroup``; translating it would surface
+            ``MCPError("MCP transport error: CancelledError")`` and break the
+            SDK's cancellation contract. This is the same
+            classification-ordering rule the ``on_tool_error`` hook documents
+            (and loop.py's classifier follows): cancellation always wins over
+            error translation.
         """
         leaves = _iter_leaf_exceptions(exc)
+        for leaf in leaves:
+            if not isinstance(leaf, Exception):
+                raise leaf
         # Prefer a nested protocol error (a 4xx/handshake failure can surface
         # as an McpError inside the transport task group).
         for leaf in leaves:
