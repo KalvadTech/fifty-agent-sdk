@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -10,6 +12,7 @@ from fifty_agent_sdk.llm.types import (
     ChatRequest,
     ChatResponse,
     ToolCall,
+    ToolChoiceFunction,
     Usage,
 )
 
@@ -168,6 +171,37 @@ def test_chat_request_accepts_tools_and_tool_choice() -> None:
     )
     assert req.tools == tools
     assert req.tool_choice == "auto"
+
+
+def test_chat_request_accepts_tool_choice_dict_form() -> None:
+    """The specific-tool ``tool_choice`` object passes validation verbatim."""
+    choice: ToolChoiceFunction = {"type": "function", "function": {"name": "search"}}
+    req = ChatRequest(
+        messages=[ChatMessage(role="user", content="hi")],
+        model="gpt-4o",
+        tools=[{"type": "function", "function": {"name": "search"}}],
+        tool_choice=choice,
+    )
+    assert req.tool_choice == {"type": "function", "function": {"name": "search"}}
+
+
+@pytest.mark.parametrize(
+    "bad_choice",
+    [
+        {"type": "function"},  # missing required "function" member
+        {"type": "not-a-function", "function": {"name": "search"}},
+        {"function": {"name": "search"}},  # missing required "type"
+        {"type": "function", "function": {}},  # missing required "name"
+        42,
+    ],
+)
+def test_chat_request_rejects_malformed_tool_choice(bad_choice: Any) -> None:
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            messages=[ChatMessage(role="user", content="hi")],
+            model="gpt-4o",
+            tool_choice=bad_choice,
+        )
 
 
 def test_chat_request_forbids_extra_fields() -> None:

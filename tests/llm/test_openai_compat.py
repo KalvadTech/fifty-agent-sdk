@@ -16,7 +16,7 @@ from pytest_httpx import HTTPXMock
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.llm.openai_compat import OpenAICompatibleClient
 from fifty_agent_sdk.llm.protocol import LLMClient
-from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ToolCall
+from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ToolCall, ToolChoiceFunction
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -444,6 +444,23 @@ async def test_build_body_tool_choice_override(httpx_mock: HTTPXMock) -> None:
     assert raw is not None
     body = json.loads(raw.read())
     assert body["tool_choice"] == "required"
+
+
+async def test_build_body_tool_choice_dict_form_on_wire(httpx_mock: HTTPXMock) -> None:
+    """The specific-tool `tool_choice` object is emitted verbatim on the wire."""
+    choice: ToolChoiceFunction = {"type": "function", "function": {"name": "search"}}
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(
+        _basic_request(
+            tools=[{"type": "function", "function": {"name": "search"}}],
+            tool_choice=choice,
+        )
+    )
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assert body["tool_choice"] == {"type": "function", "function": {"name": "search"}}
 
 
 async def test_assistant_tool_calls_envelope_on_wire(httpx_mock: HTTPXMock) -> None:

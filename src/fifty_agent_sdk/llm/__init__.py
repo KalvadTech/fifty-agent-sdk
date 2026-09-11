@@ -14,6 +14,8 @@ from fifty_agent_sdk.llm.types import (
     FinishReason,
     Role,
     ToolCall,
+    ToolChoiceFunction,
+    ToolChoiceFunctionName,
     Usage,
 )
 
@@ -26,5 +28,7 @@ __all__ = [
     "OpenAICompatibleClient",
     "Role",
     "ToolCall",
+    "ToolChoiceFunction",
+    "ToolChoiceFunctionName",
     "Usage",
 ]

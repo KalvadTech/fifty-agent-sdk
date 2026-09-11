@@ -13,7 +13,7 @@ ride along to consumers.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -115,6 +115,24 @@ class Usage(BaseModel):
     total_tokens: int = Field(ge=0)
 
 
+class ToolChoiceFunctionName(TypedDict):
+    """The ``function`` member of :class:`ToolChoiceFunction`."""
+
+    name: str
+
+
+class ToolChoiceFunction(TypedDict):
+    """The specific-tool form of :attr:`ChatRequest.tool_choice`.
+
+    Mirrors the OpenAI ``ChatCompletionNamedToolChoiceParam`` shape —
+    ``{"type": "function", "function": {"name": ...}}`` — and forces the
+    model to call the named function instead of choosing freely.
+    """
+
+    type: Literal["function"]
+    function: ToolChoiceFunctionName
+
+
 class ChatRequest(BaseModel):
     """Provider-agnostic chat-completion request.
 
@@ -135,10 +153,11 @@ class ChatRequest(BaseModel):
             default) means NO tools are declared and the request wire is
             byte-for-byte the pre-BR-008 shape.
         tool_choice: Optional steering for native tool-calling when
-            :attr:`tools` is set. Common values are ``"auto"`` (the default
-            the adapter emits when this is ``None``), ``"required"``,
-            ``"none"``, or a specific-tool object
-            ``{"type": "function", "function": {"name": ...}}``. Ignored when
+            :attr:`tools` is set. Accepts a mode string — ``"auto"`` (the
+            default the adapter emits when this is ``None``),
+            ``"required"``, or ``"none"`` — or a :class:`ToolChoiceFunction`
+            object ``{"type": "function", "function": {"name": ...}}`` that
+            forces the model to call the named function. Ignored when
             :attr:`tools` is ``None``.
     """
 
@@ -150,7 +169,7 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = Field(default=None, ge=1)
     response_format: dict[str, Any] | None = None
     tools: list[dict[str, Any]] | None = None
-    tool_choice: str | None = None
+    tool_choice: str | ToolChoiceFunction | None = None
 
 
 class ChatResponse(BaseModel):
@@ -184,5 +203,7 @@ __all__ = [
     "FinishReason",
     "Role",
     "ToolCall",
+    "ToolChoiceFunction",
+    "ToolChoiceFunctionName",
     "Usage",
 ]
