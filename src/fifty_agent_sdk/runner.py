@@ -66,8 +66,9 @@ Observability hooks
     When an optional :class:`fifty_agent_sdk.observability.Hooks` is wired in,
     the Runner fires five of the seven hooks: ``on_run_start`` once at run
     start, ``on_tool_start`` / ``on_tool_end`` per tool invocation,
-    ``on_error`` on a loop or durability failure, and ``on_run_end`` once
-    from the ``finally`` block on EVERY exit path. The remaining two hooks
+    ``on_error`` on a loop-internal, durability, or fatal-SDK-error
+    failure, and ``on_run_end`` once from the ``finally`` block on EVERY
+    exit path. The remaining two hooks
     (``on_iteration``, ``on_llm_call``) are Loop-tier — the consumer must
     wire the SAME :class:`Hooks` instance into :class:`fifty_agent_sdk.loop.
     AgentLoop` as well. The Runner does NOT forward ``hooks`` into the loop;
@@ -98,8 +99,18 @@ Logging
       the load/append calls. A companion ``phase`` field names which
       site failed: ``"load"``, ``"persist_system"``, ``"persist_user"``,
       or ``"persist_assistant"``.
-    * ``"cancelled"`` — caller cancelled the consumer task or broke out
-      of the ``async for`` via ``aclose()``.
+    * ``"cancelled"`` — the consumer task was cancelled while the run was
+      in flight; :class:`asyncio.CancelledError` propagates untouched.
+    * ``"interrupted"`` — fallback for every other exit path not
+      attributable to the categories above: an unexpected non-SDK
+      exception escaping the loop, or the consumer breaking out of the
+      ``async for`` / closing the generator via ``aclose()`` (which
+      surfaces as :class:`GeneratorExit`, not cancellation).
+    * ``"sdk_error"`` — a fatal :class:`fifty_agent_sdk.errors.AgentSdkError`
+      subclass escaped the loop as an exception (for example an
+      :class:`~fifty_agent_sdk.errors.MCPError` re-raised by the tool
+      registry). The Runner audits the error, fires ``on_error``, passes
+      the exception to ``on_run_end``, and re-raises it.
 """
 
 from __future__ import annotations
@@ -115,7 +126,7 @@ from uuid import uuid4
 import structlog
 
 from fifty_agent_sdk.audit import AuditEvent, AuditSink
-from fifty_agent_sdk.errors import StateStoreError
+from fifty_agent_sdk.errors import AgentSdkError, StateStoreError
 from fifty_agent_sdk.llm.types import ChatMessage
 from fifty_agent_sdk.loop import AgentLoop
 from fifty_agent_sdk.observability import Hooks
@@ -442,9 +453,18 @@ class AgentRunner:
            parsed text on the safety paths. Otherwise skip — the
            fallback final answer is yielded but not committed.
 
-        On consumer cancellation (the consumer breaks out of the
-        ``async for`` loop): :class:`asyncio.CancelledError` propagates
-        untouched. The user message persisted in step 3 survives; no
+        On consumer cancellation (the consumer task is cancelled):
+        :class:`asyncio.CancelledError` propagates untouched. The user
+        message persisted in step 3 survives; no assistant message is
+        persisted.
+
+        On a fatal :class:`fifty_agent_sdk.errors.AgentSdkError` escaping the
+        loop (for example an :class:`~fifty_agent_sdk.errors.MCPError`
+        re-raised by the tool registry — :meth:`AgentLoop.run` documents
+        that non-recoverable SDK errors propagate): the Runner emits the
+        ``error`` audit event, fires ``on_error`` with the exception,
+        records it for ``on_run_end``, sets ``terminated_by="sdk_error"``,
+        and re-raises so the exception still reaches the caller. No
         assistant message is persisted.
 
         On :class:`fifty_agent_sdk.errors.StateStoreError` raised by the state
@@ -458,12 +478,18 @@ class AgentRunner:
 
         Yields:
             :class:`AgentEvent` values forwarded from the inner
-            :class:`AgentLoop` in monotonic ``sequence`` order. The
-            terminal event is always a :class:`FinalEvent`.
+            :class:`AgentLoop` in monotonic ``sequence`` order. On a clean
+            or loop-internal-failure termination the terminal event is a
+            :class:`FinalEvent`; a fatal :class:`AgentSdkError` escaping the
+            loop ends the stream by raising instead.
 
         Raises:
             fifty_agent_sdk.errors.StateStoreError: If any state-store
                 operation fails. The error is logged before being
+                re-raised.
+            fifty_agent_sdk.errors.AgentSdkError: Any fatal SDK error the
+                loop lets propagate. It is audited, reported to
+                ``on_error``, and passed to ``on_run_end`` before being
                 re-raised.
             asyncio.CancelledError: Propagated untouched from the loop
                 or from the consumer's cancellation.
@@ -480,8 +506,9 @@ class AgentRunner:
                 ``run_id``, ``terminated_by``,
                 ``assistant_message_persisted``, ``event_count``,
                 ``final_event_type``, ``phase``. ``terminated_by`` is one
-                of ``"final_answer"``, ``"error"``,
-                ``"state_store_error"``, or ``"cancelled"``.
+                of ``"final_answer"``, ``"error"``, ``"sdk_error"``,
+                ``"state_store_error"``, ``"cancelled"``, or
+                ``"interrupted"`` (see the module docstring).
             ``runner.persist_failed`` (ERROR): Emitted at each of the four
                 state-store boundaries — load, system-prompt persist, user
                 persist, assistant persist — when the underlying
@@ -542,11 +569,14 @@ class AgentRunner:
         await self._invoke_hook("on_run_start", session_id, user_message)
 
         # Initial value is "interrupted" — neutral and applies to any
-        # unexpected exit path (e.g. an exception escaping the loop that
-        # we did not catch explicitly). The dedicated
+        # unexpected exit path (e.g. a non-SDK exception escaping the loop
+        # that we did not catch explicitly, or the consumer closing the
+        # generator via ``aclose()``). The dedicated
         # ``except asyncio.CancelledError`` branch upgrades this to
         # ``"cancelled"`` ONLY when we can attribute exit to an actual
-        # task/consumer cancellation.
+        # task/consumer cancellation, and the ``except AgentSdkError``
+        # branch upgrades it to ``"sdk_error"`` for a fatal SDK error
+        # escaping the loop.
         terminated_by = "interrupted"
         state_store_error_phase: str | None = None
         saw_error = False
@@ -555,8 +585,9 @@ class AgentRunner:
         event_count = 0
         # `run_error` carries the exception that terminated the run, for the
         # `on_run_end` hook. It is set ONLY by an exception that escaped the
-        # run — a `StateStoreError` from a persist site or a surfaced
-        # `CancelledError`. Typed `BaseException | None` because
+        # run — a `StateStoreError` from a persist site, a fatal
+        # `AgentSdkError` escaping the loop, or a surfaced `CancelledError`.
+        # Typed `BaseException | None` because
         # `asyncio.CancelledError` is a `BaseException`, not an `Exception`.
         # A loop-internal failure surfaces an `ErrorEvent` (not a Python
         # exception) and is reported via `on_error`; for that path
@@ -821,11 +852,43 @@ class AgentRunner:
                         },
                     )
         except asyncio.CancelledError as exc:
-            # Caller cancelled the consumer task (or broke out via
-            # ``aclose()``). Attribute exit to cancellation and let the
-            # exception propagate untouched.
+            # The consumer task was cancelled while the run was in flight.
+            # Attribute exit to cancellation and let the exception propagate
+            # untouched. (``aclose()`` surfaces as GeneratorExit instead and
+            # leaves `terminated_by` at its "interrupted" fallback.)
             terminated_by = "cancelled"
             run_error = exc
+            raise
+        except AgentSdkError as exc:
+            if isinstance(exc, StateStoreError):
+                # Persist-site failures already emitted their `error` audit
+                # event and fired `on_error` at the site; the `finally`
+                # block upgrades `terminated_by` to "state_store_error".
+                raise
+            # A fatal SDK error escaped the loop (e.g. an MCPError re-raised
+            # by the tool registry — AgentLoop.run documents that
+            # non-recoverable SDK errors propagate). Audit it and fire
+            # `on_error` BEFORE re-raising, mirroring the persist-site
+            # convention (the `finally` block must not await the sink while
+            # an exception is in flight); `run_error` hands it to
+            # `on_run_end`.
+            terminated_by = "sdk_error"
+            run_error = exc
+            await self._emit_audit(
+                session_id,
+                "error",
+                {
+                    "run_id": run_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            await self._invoke_hook(
+                "on_error",
+                session_id,
+                exc,
+                {"error_type": type(exc).__name__, **dict(exc.context)},
+            )
             raise
         finally:
             if state_store_error_phase is not None:
@@ -843,9 +906,10 @@ class AgentRunner:
             )
             # `on_run_end` fires on EVERY exit path. `run_error` is
             # non-`None` only for an exception that escaped the run (a
-            # `StateStoreError` or the surfaced `CancelledError`); a
-            # loop-internal `terminated_by == "error"` keeps it `None`
-            # (`on_error` already fired for that). Awaiting a hook in
+            # `StateStoreError`, a fatal `AgentSdkError` from the loop, or
+            # the surfaced `CancelledError`); a loop-internal
+            # `terminated_by == "error"` keeps it `None` (`on_error` already
+            # fired for that). Awaiting a hook in
             # `finally` is safe: `_invoke_hook`/`invoke_hook` swallow every
             # `Exception` and re-raise only `CancelledError`, so a raising
             # `on_run_end` cannot mask an in-flight `StateStoreError`.

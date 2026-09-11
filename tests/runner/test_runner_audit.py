@@ -278,6 +278,49 @@ async def test_llm_error_run_emits_session_start_then_error() -> None:
     assert "run_id" in error_event.payload
 
 
+async def test_fatal_sdk_error_escaping_loop_is_audited() -> None:
+    """An MCPError escaping the loop emits an error audit event, terminates
+    with ``terminated_by="sdk_error"``, and still re-raises to the caller.
+
+    The registry re-raises non-recoverable :class:`AgentSdkError` subclasses
+    untouched, so an MCP transport failure propagates out of the loop as an
+    exception rather than as an ErrorEvent. Before this fix such a run exited
+    invisibly: no error audit event and ``terminated_by="interrupted"``.
+    """
+    import pytest
+
+    from fifty_agent_sdk.errors import MCPError
+
+    registry = Registry()
+    registry.register(
+        FakeTool(
+            "mcp_tool",
+            raises=MCPError("transport down", context={"server_url": "https://mcp.example.com"}),
+        )
+    )
+    llm = FakeLLMClient(replies=[make_response(tool_json("t", "mcp_tool", {}))])
+    spy = SpyAuditSink()
+    runner, store = make_runner(llm=llm, registry=registry, audit=spy)
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(MCPError):
+        await collect(runner.run("s1", "Hi"))
+
+    # The escaped SDK error is audited like any other error.
+    assert [e.event_type for e in spy.events] == ["session_start", "error"]
+    error_event = spy.events[-1]
+    assert error_event.payload["error_type"] == "MCPError"
+    assert "transport down" in error_event.payload["error_message"]
+
+    # The run_completed log attributes the exit to the escaped SDK error.
+    completed = [e for e in logs if e.get("event") == "runner.run_completed"]
+    assert len(completed) == 1
+    assert completed[0]["terminated_by"] == "sdk_error"
+
+    # No assistant message was committed; the durable user message survives.
+    history = await store.get_messages("s1")
+    assert [m.role for m in history] == ["user"]
+
+
 async def test_state_store_error_on_assistant_persist_is_audited() -> None:
     """A persist_assistant durability failure emits an error audit event."""
     from fifty_agent_sdk import (

@@ -125,7 +125,9 @@ class Hooks:
             ``duration_ms`` is a monotonic wall measurement of the whole
             run. ``error`` is typed ``BaseException | None`` — non-``None``
             ONLY when an exception terminated the run (a
-            :class:`~fifty_agent_sdk.errors.StateStoreError`, or a surfaced
+            :class:`~fifty_agent_sdk.errors.StateStoreError`, a fatal
+            :class:`~fifty_agent_sdk.errors.AgentSdkError` escaping the loop,
+            or a surfaced
             :class:`asyncio.CancelledError` which is a
             :class:`BaseException`, not an :class:`Exception`, hence the
             wider type). A loop-internal failure surfaces an
@@ -154,9 +156,11 @@ class Hooks:
             tool's start and terminal events. Runner tier.
         on_error: ``(session_id, error, context) -> Any``. Fires on a
             loop-internal failure (a synthesized exception built from the
-            :class:`~fifty_agent_sdk.streaming.ErrorEvent`) and on a state-store
+            :class:`~fifty_agent_sdk.streaming.ErrorEvent`), on a state-store
             durability failure (the caught
-            :class:`~fifty_agent_sdk.errors.StateStoreError`). ``context`` is a
+            :class:`~fifty_agent_sdk.errors.StateStoreError`), and on a fatal
+            :class:`~fifty_agent_sdk.errors.AgentSdkError` escaping the loop
+            (the exception itself, before it is re-raised). ``context`` is a
             structured detail dict. Runner tier.
     """
 
