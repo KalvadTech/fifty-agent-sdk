@@ -39,8 +39,11 @@ Failure isolation
     A raising hook never breaks a run. :func:`invoke_hook` catches
     :class:`Exception`, logs a ``WARNING`` (event ``hook.invoke_failed``)
     under the fixed ``fifty_agent_sdk.observability`` logger, and swallows it.
-    :class:`asyncio.CancelledError` is the one exception re-raised
-    untouched so consumer cancellation still propagates.
+    The log line carries the hook name and the exception TYPE only — never
+    ``str(exc)`` — because hook arguments are high-value (user message,
+    ``ChatRequest``, tool args) and a hook may embed them in its own
+    exception message. :class:`asyncio.CancelledError` is the one exception
+    re-raised untouched so consumer cancellation still propagates.
 
 Hot-path latency
     Hooks are awaited INLINE. A slow ``on_iteration`` or ``on_llm_call``
@@ -205,7 +208,10 @@ async def invoke_hook(
       untouched (consumer cancellation must propagate); any other
       :class:`Exception` is logged at ``WARNING`` (event
       ``hook.invoke_failed``) under the ``fifty_agent_sdk.observability`` logger
-      and swallowed — a hook failure NEVER aborts a run.
+      and swallowed — a hook failure NEVER aborts a run. The log line
+      carries the exception TYPE only, never ``str(exc)``: hooks receive
+      high-value objects (the raw user message, the full ``ChatRequest``,
+      tool args) and a hook may embed them in its exception message.
 
     Args:
         hook: The callable to invoke, or ``None`` for a no-op.
@@ -225,11 +231,17 @@ async def invoke_hook(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        # Log the exception TYPE only — never str(exc). Hooks receive
+        # high-value objects (on_run_start gets the raw user_message,
+        # on_llm_call the full ChatRequest, on_tool_start the tool args),
+        # and a hook may embed them in its own exception message
+        # (`ValueError(f"unexpected: {request.messages}")`); logging
+        # str(exc) would dump that content into a WARNING line. This
+        # matches the mcp.client tool-error-hook logging discipline.
         _log.warning(
             "hook.invoke_failed",
             hook_name=hook_name,
             error_type=type(exc).__name__,
-            error_message=str(exc),
         )
 
 

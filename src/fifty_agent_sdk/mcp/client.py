@@ -864,12 +864,13 @@ class MCPClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # DELIBERATE DIVERGENCE from `invoke_hook`, which logs `str(exc)`:
-            # a hook screening untrusted server content may embed that content
-            # in its own exception message (`ValueError(f"bad: {content}")`), and
-            # this module's standing rule is that untrusted material never
-            # reaches a log line. Log the exception TYPE only — never its text,
-            # never `content`, never the message.
+            # Same discipline as `invoke_hook` (which now also logs the
+            # exception TYPE only): a hook screening untrusted server content
+            # may embed that content in its own exception message
+            # (`ValueError(f"bad: {content}")`), and this module's standing
+            # rule is that untrusted material never reaches a log line. Log
+            # the exception TYPE only — never its text, never `content`,
+            # never the message.
             _log.warning(
                 "mcp.tool_error_hook_failed",
                 tool_name=tool_name,
