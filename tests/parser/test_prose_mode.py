@@ -190,6 +190,38 @@ def test_huge_whitespace_payload_does_not_hang() -> None:
     assert excinfo.value.context["error_phase"] == "empty_completion"
 
 
+def test_deeply_nested_action_input_raises_parser_error_not_recursion_error() -> None:
+    """Pathological nesting trips ``RecursionError`` inside ``json.loads``; the
+    Parser contract mandates ``ParserError`` (see the JSON-mode twin test).
+    Depth 100k exceeds the recursion threshold of both the C and the pure
+    Python ``json`` scanners regardless of ``sys.getrecursionlimit``."""
+    depth = 100_000
+    body = "[" * depth + "]" * depth
+    completion = f"Thought: T\nAction: search\nAction Input: {body}"
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["parser"] == "ProseModeParser"
+    assert ctx["error_phase"] == "action_input_decode"
+    assert "RecursionError" in str(ctx["cause"])
+
+
+def test_deeply_nested_fenced_action_input_raises_parser_error() -> None:
+    """Recovery-pass arm: the strict pass fails with JSONDecodeError on the
+    fence wrapper, the recovered fence body is the deeply nested payload, and
+    the second ``json.loads`` raises ``RecursionError`` — still ``ParserError``.
+    The payload uses object nesting (not arrays) because the fence-recovery
+    slicer keys off ``{``/``}``."""
+    depth = 100_000
+    body = '{"a":' * depth + "1" + "}" * depth
+    completion = f"Thought: T\nAction: search\nAction Input: ```json\n{body}\n```"
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["error_phase"] == "action_input_decode"
+    assert "RecursionError" in str(ctx["cause"])
+
+
 # ---------------------------------------------------------------------- #
 # Protocol                                                               #
 # ---------------------------------------------------------------------- #

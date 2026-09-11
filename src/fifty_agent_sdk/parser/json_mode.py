@@ -114,7 +114,10 @@ class JsonModeParser:
 
     * ``error_phase="empty_completion"`` — empty/whitespace-only input.
     * ``error_phase="json_decode"`` — both the strict and the recovery pass
-      failed to produce valid JSON.
+      failed to produce valid JSON, or the input nested deeper than the
+      interpreter recursion limit (``json.loads`` raises
+      :class:`RecursionError` there, translated into :class:`ParserError`
+      so the loop's ``ParserError`` contract holds).
     * ``error_phase="schema_validation"`` — JSON decoded but the envelope
       does not match the schema (unknown key, wrong ``action`` value,
       missing required field for the chosen action).
@@ -140,9 +143,27 @@ class JsonModeParser:
     # ------------------------------------------------------------------ #
 
     def _load_json(self, completion: str) -> Any:
-        """Strict-then-recover JSON decode. Raises on total failure."""
+        """Strict-then-recover JSON decode. Raises on total failure.
+
+        :class:`RecursionError` from a pathologically nested input is caught
+        at BOTH decode attempts and translated into :class:`ParserError`
+        (``error_phase="json_decode"``): the :class:`Parser` protocol mandates
+        ``ParserError`` on malformed input, and the loop catches only
+        ``ParserError`` — a raw ``RecursionError`` would escape the async
+        generator with no ``ErrorEvent`` and no terminal ``FinalEvent``.
+        """
         try:
             return json.loads(completion.strip())
+        except RecursionError as depth_err:
+            raise ParserError(
+                "could not decode JSON envelope: nesting depth exceeds the recursion limit",
+                context={
+                    "parser": "JsonModeParser",
+                    "error_phase": "json_decode",
+                    "completion_excerpt": completion[:_MAX_EXCERPT],
+                    "cause": repr(depth_err),
+                },
+            ) from depth_err
         except json.JSONDecodeError as first_err:
             recovered = _strip_code_fences(completion)
             if recovered is None:
@@ -157,6 +178,16 @@ class JsonModeParser:
                 ) from first_err
             try:
                 return json.loads(recovered)
+            except RecursionError as depth_err:
+                raise ParserError(
+                    "could not decode JSON envelope: nesting depth exceeds the recursion limit",
+                    context={
+                        "parser": "JsonModeParser",
+                        "error_phase": "json_decode",
+                        "completion_excerpt": completion[:_MAX_EXCERPT],
+                        "cause": repr(depth_err),
+                    },
+                ) from depth_err
             except json.JSONDecodeError as second_err:
                 raise ParserError(
                     "could not decode JSON envelope after fence recovery",

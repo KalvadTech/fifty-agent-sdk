@@ -64,7 +64,9 @@ class ProseModeParser:
     * ``error_phase="header_match"`` — neither pattern matched.
     * ``error_phase="action_input_decode"`` — the ``Action Input:`` body
       could not be parsed as JSON, even after the shared fence-stripping
-      recovery pass.
+      recovery pass, or it nested deeper than the interpreter recursion
+      limit (:class:`RecursionError` from ``json.loads``, translated into
+      :class:`ParserError` so the loop's ``ParserError`` contract holds).
     """
 
     def parse(self, completion: str) -> ParseResult:
@@ -118,9 +120,25 @@ class ProseModeParser:
         return FinalAnswer(thought=thought, content=answer)
 
     def _decode_action_input(self, body: str, completion: str) -> dict[str, object]:
-        """Decode the ``Action Input:`` body as JSON, with one fence retry."""
+        """Decode the ``Action Input:`` body as JSON, with one fence retry.
+
+        :class:`RecursionError` from a pathologically nested body is caught at
+        BOTH decode attempts and translated into :class:`ParserError`
+        (``error_phase="action_input_decode"``) — the same ``ParserError``-only
+        contract the JSON-mode parser upholds on its own decode path.
+        """
         try:
             decoded = json.loads(body)
+        except RecursionError as depth_err:
+            raise ParserError(
+                "could not decode Action Input JSON: nesting depth exceeds the recursion limit",
+                context={
+                    "parser": "ProseModeParser",
+                    "error_phase": "action_input_decode",
+                    "completion_excerpt": completion[:_MAX_EXCERPT],
+                    "cause": repr(depth_err),
+                },
+            ) from depth_err
         except json.JSONDecodeError as first_err:
             recovered = _strip_code_fences(body)
             if recovered is None:
@@ -135,6 +153,16 @@ class ProseModeParser:
                 ) from first_err
             try:
                 decoded = json.loads(recovered)
+            except RecursionError as depth_err:
+                raise ParserError(
+                    "could not decode Action Input JSON: nesting depth exceeds the recursion limit",
+                    context={
+                        "parser": "ProseModeParser",
+                        "error_phase": "action_input_decode",
+                        "completion_excerpt": completion[:_MAX_EXCERPT],
+                        "cause": repr(depth_err),
+                    },
+                ) from depth_err
             except json.JSONDecodeError as second_err:
                 raise ParserError(
                     "could not decode Action Input JSON after fence recovery",

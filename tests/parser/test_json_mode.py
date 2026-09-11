@@ -218,6 +218,39 @@ def test_parser_error_chains_cause_via_raise_from() -> None:
     assert excinfo.value.__cause__ is not None
 
 
+def test_deeply_nested_json_raises_parser_error_not_recursion_error() -> None:
+    """Pathological nesting trips ``RecursionError`` inside ``json.loads``.
+
+    The Parser contract (parser/base.py) mandates ``ParserError`` on malformed
+    input and the loop catches only ``ParserError`` — a raw ``RecursionError``
+    would escape the async generator with no ``ErrorEvent``/``FinalEvent``.
+    Depth 100k exceeds the recursion threshold of both the C and the pure
+    Python ``json`` scanners regardless of ``sys.getrecursionlimit``.
+    """
+    depth = 100_000
+    completion = '{"a":' * depth + "1" + "}" * depth
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["parser"] == "JsonModeParser"
+    assert ctx["error_phase"] == "json_decode"
+    assert "RecursionError" in str(ctx["cause"])
+
+
+def test_deeply_nested_json_behind_prose_prefix_raises_parser_error() -> None:
+    """Recovery-pass arm: the strict pass fails with JSONDecodeError, then the
+    fence-slice recovery candidate is the deeply nested payload and the second
+    ``json.loads`` raises ``RecursionError`` — still a ``ParserError``."""
+    depth = 100_000
+    nested = '{"a":' * depth + "1" + "}" * depth
+    completion = f"Sure! Here you go: {nested} -- hope that helps"
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["error_phase"] == "json_decode"
+    assert "RecursionError" in str(ctx["cause"])
+
+
 # ---------------------------------------------------------------------- #
 # Protocol / cross-brief contract                                        #
 # ---------------------------------------------------------------------- #
