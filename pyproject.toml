@@ -128,6 +128,10 @@ exclude = ["tests/", "build/", ".venv/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Pin the fixture loop scope explicitly (TD-004): "function" is pytest-asyncio's
+# current default, and setting it silences the unset-option deprecation warning
+# while pinning the behavior against a future default change.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = ["-v", "--tb=short", "--strict-markers", "--import-mode=importlib"]
