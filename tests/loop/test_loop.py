@@ -125,6 +125,45 @@ async def _collect(
 
 
 # ---------------------------------------------------------------------------
+# Construction-time validation
+# ---------------------------------------------------------------------------
+
+
+def test_stream_with_native_tools_enabled_raises_value_error() -> None:
+    """stream=True + native_tools_enabled=True is rejected at construction.
+
+    A streamed completion carries no structured ``tool_calls`` (the adapter
+    drops streamed tool-call deltas), so the combination could never dispatch
+    a native tool call — it must fail fast at ``__init__`` with a ValueError
+    instead of silently burning the parser retry and ending on the fallback.
+    """
+    llm = FakeLLMClient([make_response(_final_json("never reached"))])
+    with pytest.raises(ValueError, match="stream=True"):
+        _make_loop(llm=llm, stream=True, safety=SafetyConfig(native_tools_enabled=True))
+
+
+@pytest.mark.parametrize(
+    ("stream", "native_tools_enabled"),
+    [
+        (False, False),
+        (False, True),
+        (True, False),
+    ],
+)
+def test_other_stream_native_combinations_construct(
+    stream: bool, native_tools_enabled: bool
+) -> None:
+    """Every other stream/native combination remains constructible."""
+    llm = FakeLLMClient([make_response(_final_json("ok"))])
+    loop = _make_loop(
+        llm=llm,
+        stream=stream,
+        safety=SafetyConfig(native_tools_enabled=native_tools_enabled),
+    )
+    assert isinstance(loop, AgentLoop)
+
+
+# ---------------------------------------------------------------------------
 # Happy single-step
 # ---------------------------------------------------------------------------
 

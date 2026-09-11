@@ -12,10 +12,15 @@ Statelessness
     retry orchestration are a higher Runner's job (see BR-007).
 
 System prompt snapshot
-    The system prompt is constructed ONCE at :meth:`AgentLoop.run` start
+    The system prompt is constructed ONCE at ``AgentLoop.__init__``
     from a snapshot of :meth:`fifty_agent_sdk.tools.registry.Registry.list`.
-    Tools registered AFTER ``run()`` begins are NOT visible to the
-    model. Dynamic-tool consumers must rebuild the loop.
+    In the default text/JSON mode, tools registered AFTER construction are
+    NOT visible to the model. Dynamic-tool consumers must rebuild the loop.
+    Under native-tools mode
+    (:attr:`fifty_agent_sdk.safety.SafetyConfig.native_tools_enabled`) the
+    prompt-side tool block is suppressed and the OpenAI ``tools`` request
+    param is rebuilt from the registry on EVERY iteration, so late
+    registrations ARE declared to the provider on subsequent turns.
 
 Cancellation
     :class:`asyncio.CancelledError` propagates untouched. The most
@@ -30,6 +35,13 @@ Streaming semantics
     is emitted — the parser requires the complete structured completion
     to disambiguate ``tool`` versus ``final``. This is a deliberate
     contract trade-off.
+
+    Streaming is INCOMPATIBLE with native-tools mode: a streamed response
+    carries no structured ``tool_calls`` (the adapter deliberately drops
+    streamed tool-call deltas), so a ``stream=True`` +
+    ``native_tools_enabled=True`` loop would parse empty completions and
+    terminate on the fallback. ``AgentLoop(...)`` raises ``ValueError``
+    at construction when both are enabled.
 """
 
 from __future__ import annotations
@@ -283,7 +295,10 @@ class AgentLoop:
         stream: If ``True``, use :meth:`LLMClient.stream` and emit
             :class:`fifty_agent_sdk.streaming.TokenEvent` for the FINAL answer
             only. Default ``False`` — uses :meth:`LLMClient.complete`,
-            no token events.
+            no token events. MUST NOT be combined with
+            ``SafetyConfig(native_tools_enabled=True)`` — streamed responses
+            carry no structured ``tool_calls``, so that combination is
+            rejected at construction (see Raises).
         output_format: Optional override for the system prompt's
             ``output_format`` slot. When non-empty, replaces whatever is
             in ``prompts.output_format``. Useful for callers that want
@@ -310,6 +325,16 @@ class AgentLoop:
             receive ``hooks`` from a Runner — the two are wired
             independently by the consumer). A raising hook never aborts the
             loop. When ``None`` (default), hook dispatch is zero-overhead.
+
+    Raises:
+        ValueError: When ``stream=True`` is combined with
+            ``SafetyConfig(native_tools_enabled=True)``. A streamed
+            completion carries no structured ``tool_calls`` (the LLM
+            adapter deliberately drops streamed tool-call deltas), so the
+            combination can never dispatch a native tool call — every
+            streamed turn would parse empty content, burn the parser
+            retry, and terminate on the fallback message. The
+            misconfiguration is rejected at construction instead.
     """
 
     def __init__(
@@ -328,6 +353,14 @@ class AgentLoop:
         tool_message_role: Literal["tool", "user", "assistant"] = "tool",
         hooks: Hooks | None = None,
     ) -> None:
+        if stream and safety.native_tools_enabled:
+            raise ValueError(
+                "stream=True is incompatible with "
+                "SafetyConfig(native_tools_enabled=True): a streamed "
+                "completion carries no structured tool_calls, so native "
+                "tool dispatch can never fire. Disable streaming or turn "
+                "native_tools_enabled off."
+            )
         self._llm = llm
         self._registry = registry
         self._parser = parser
