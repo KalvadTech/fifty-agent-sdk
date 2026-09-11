@@ -127,6 +127,16 @@ def test_chat_request_accepts_boundary_temperatures() -> None:
         assert req.temperature == t
 
 
+def test_chat_request_accepts_none_temperature() -> None:
+    """``None`` is the explicit opt-out: the adapter omits the key from the body."""
+    req = ChatRequest(
+        messages=[ChatMessage(role="user", content="hi")],
+        model="gpt-4o",
+        temperature=None,
+    )
+    assert req.temperature is None
+
+
 def test_chat_request_rejects_zero_max_tokens() -> None:
     with pytest.raises(ValidationError):
         ChatRequest(

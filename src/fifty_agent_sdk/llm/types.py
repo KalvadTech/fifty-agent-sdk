@@ -140,6 +140,11 @@ class ChatRequest(BaseModel):
         messages: Ordered list of conversation messages.
         model: Model identifier. Adapters may override this with a default.
         temperature: Sampling temperature in ``[0.0, 2.0]``. Default ``0.0``.
+            Set to ``None`` to OMIT the parameter from the request body
+            entirely — for providers/models (e.g. OpenAI's reasoning-model
+            family) that reject a non-default temperature. The default is
+            ``0.0`` (NOT ``None``) so existing callers' wire behavior is
+            unchanged: the key is sent unless explicitly set to ``None``.
         max_tokens: Optional cap on completion tokens. Must be ``>= 1`` if set.
         response_format: Optional provider-format hint. Common values are
             ``{"type": "json_object"}`` or ``{"type": "text"}``. Adapters
@@ -165,7 +170,7 @@ class ChatRequest(BaseModel):
 
     messages: list[ChatMessage]
     model: str
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    temperature: float | None = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1)
     response_format: dict[str, Any] | None = None
     tools: list[dict[str, Any]] | None = None

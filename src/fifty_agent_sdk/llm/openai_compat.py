@@ -323,13 +323,20 @@ class OpenAICompatibleClient:
 
     @classmethod
     def _build_body(cls, request: ChatRequest, *, model: str, stream: bool) -> dict[str, Any]:
-        """Build the kwargs passed to ``client.chat.completions.create``."""
+        """Build the kwargs passed to ``client.chat.completions.create``.
+
+        ``temperature`` is omitted entirely when :attr:`ChatRequest.temperature`
+        is ``None`` (the opt-out for providers that reject a non-default
+        temperature); at the ``0.0`` default it is sent, preserving the
+        pre-existing wire shape for every caller that does not opt out.
+        """
         body: dict[str, Any] = {
             "model": model,
             "messages": [cls._serialize_message(m) for m in request.messages],
-            "temperature": request.temperature,
             "stream": stream,
         }
+        if request.temperature is not None:
+            body["temperature"] = request.temperature
         if request.max_tokens is not None:
             body["max_tokens"] = request.max_tokens
         if request.response_format is not None:

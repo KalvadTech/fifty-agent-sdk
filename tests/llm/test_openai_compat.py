@@ -232,6 +232,28 @@ async def test_complete_omits_optional_fields_when_unset(httpx_mock: HTTPXMock) 
     assert "response_format" not in body
 
 
+async def test_build_body_sends_default_temperature(httpx_mock: HTTPXMock) -> None:
+    """The ``0.0`` default IS sent — the key is present unless explicitly ``None``."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request())
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assert body["temperature"] == 0.0
+
+
+async def test_build_body_omits_temperature_when_none(httpx_mock: HTTPXMock) -> None:
+    """``temperature=None`` removes the key entirely (reasoning-model providers)."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(temperature=None))
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assert "temperature" not in body
+
+
 @pytest.mark.parametrize(
     "upstream,expected",
     [
