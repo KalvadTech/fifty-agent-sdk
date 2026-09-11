@@ -96,7 +96,7 @@ def _to_tool_schema(input_schema: dict[str, Any]) -> ToolSchema:
     and provider function-calling envelopes reject unknown top-level keys, so
     the block cannot be shipped, and keeping a ``$ref`` without it would hand
     the LLM a dangling pointer. A server schema whose refs cannot be inlined
-    (a reference cycle or an over-deep chain) takes the same defensive
+    (a reference cycle, an over-deep chain, or an exhausted node budget) takes the same defensive
     fallback as a non-object schema: WARNING plus an empty object schema.
     Other unknown top-level JSON-Schema keys (``examples``, …) are still
     dropped: :class:`ToolSchema` exists to describe the parameter surface the
@@ -106,7 +106,8 @@ def _to_tool_schema(input_schema: dict[str, Any]) -> ToolSchema:
     if raw_type != "object":
         _log.warning(
             "mcp.input_schema.non_object",
-            type=raw_type,
+            reason="non_object_type",
+            received_type=type(raw_type).__name__,
         )
         return ToolSchema(
             type="object",
@@ -128,7 +129,8 @@ def _to_tool_schema(input_schema: dict[str, Any]) -> ToolSchema:
         # discover/attach batch, not just the offending tool's schema).
         _log.warning(
             "mcp.input_schema.unresolvable_refs",
-            reason=str(exc),
+            reason="invalid_local_refs",
+            error_type=type(exc).__name__,
         )
         return ToolSchema(
             type="object",

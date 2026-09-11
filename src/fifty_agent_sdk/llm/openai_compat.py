@@ -435,7 +435,10 @@ class OpenAICompatibleClient:
             arguments = function.arguments if function.arguments is not None else ""
             try:
                 args = json.loads(arguments) if arguments else {}
-            except json.JSONDecodeError as e:
+            except ValueError as e:
+                # json.loads also raises bare ValueError for interpreter
+                # limits such as oversized integers. Provider payloads must
+                # remain contained as LLMError without parsing exception text.
                 raise LLMError(
                     "provider tool_call arguments is not valid JSON",
                     context={

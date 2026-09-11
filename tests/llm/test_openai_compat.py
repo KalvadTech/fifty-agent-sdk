@@ -7,6 +7,7 @@ makes under the hood. No real network is required.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 import httpx
@@ -362,6 +363,33 @@ async def test_complete_malformed_arguments_raises_llm_error(httpx_mock: HTTPXMo
     assert exc.value.context["model"] == "gpt-4o"
     assert exc.value.context["arguments_excerpt"] == "not json"
     assert exc.value.__cause__ is not None
+
+
+async def test_complete_oversized_integer_arguments_raise_llm_error(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """BR-013 contains bare ValueError from native tool-call argument decoding."""
+    digits = "9" * (sys.get_int_max_str_digits() + 1)
+    arguments = f'{{"n":{digits}}}'
+    payload = _canonical_response(
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_big",
+                "type": "function",
+                "function": {"name": "calculate", "arguments": arguments},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    with pytest.raises(LLMError) as exc:
+        await client.complete(_basic_request())
+    assert str(exc.value) == "provider tool_call arguments is not valid JSON"
+    assert exc.value.context["type"] == "MalformedResponse"
+    assert exc.value.context["tool_call_id"] == "call_big"
+    assert len(str(exc.value.context["arguments_excerpt"])) <= 200
+    assert type(exc.value.__cause__) is ValueError
 
 
 async def test_complete_non_object_arguments_raises_llm_error(httpx_mock: HTTPXMock) -> None:

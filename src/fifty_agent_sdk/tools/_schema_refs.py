@@ -22,10 +22,18 @@ _DEFS_PREFIX: Final[str] = "#/$defs/"
 _MAX_EXPANSION_DEPTH: Final[int] = 32
 """Cap on ``$ref`` expansion depth.
 
-Guards against pathological reference chains (distinct defs referencing each
-other in a long chain, or diamond fan-out) that no cycle-detection set
-bounds. Genuine cycles are caught earlier and precisely by the expansion
-stack in :func:`inline_local_refs`.
+Guards against pathological reference chains where distinct definitions
+reference one another deeply. Genuine cycles are caught earlier and precisely
+by the expansion stack in :func:`inline_local_refs`; broad or diamond fan-out
+is bounded separately by :data:`_MAX_EXPANDED_NODES`.
+"""
+
+_MAX_EXPANDED_NODES: Final[int] = 10_000
+"""Maximum resolver visits for one schema expansion.
+
+Depth alone cannot bound an acyclic schema whose references fan out. Each
+dictionary, list, and scalar visit consumes one unit so untrusted schemas fail
+before exponential expansion can exhaust process memory.
 """
 
 
@@ -51,20 +59,42 @@ def inline_local_refs(node: Any, defs: Mapping[str, Any]) -> Any:
 
     Raises:
         ValueError: On a reference cycle (a def that transitively references
-            itself — a recursive model has no finite inline expansion) or when
-            expansion exceeds the depth cap. The message names the cycle.
+            itself — a recursive model has no finite inline expansion), when
+            expansion exceeds the depth cap, or when the shared node budget is
+            exhausted. Limit and traversal messages never include schema
+            content; cycle diagnostics name the involved definition ids.
     """
-    return _resolve(node, defs, _stack=(), _depth=0)
+    budget = [_MAX_EXPANDED_NODES]
+    try:
+        return _resolve(node, defs, _stack=(), _depth=0, _budget=budget)
+    except RecursionError as exc:
+        # Ordinary dict/list nesting does not advance the $ref depth counter.
+        # Contain the interpreter's traversal limit at this untrusted-data
+        # boundary without exposing any schema content in the error message.
+        raise ValueError("schema traversal exceeded the safe nesting limit") from exc
 
 
-def _resolve(node: Any, defs: Mapping[str, Any], *, _stack: tuple[str, ...], _depth: int) -> Any:
+def _resolve(
+    node: Any,
+    defs: Mapping[str, Any],
+    *,
+    _stack: tuple[str, ...],
+    _depth: int,
+    _budget: list[int],
+) -> Any:
+    _budget[0] -= 1
+    if _budget[0] < 0:
+        raise ValueError(f"$ref expansion exceeded the {_MAX_EXPANDED_NODES}-node budget")
     if isinstance(node, dict):
         ref = node.get("$ref")
         if isinstance(ref, str) and ref.startswith(_DEFS_PREFIX):
             name = ref[len(_DEFS_PREFIX) :]
             target = defs.get(name)
             if target is None:
-                return {k: _resolve(v, defs, _stack=_stack, _depth=_depth) for k, v in node.items()}
+                return {
+                    k: _resolve(v, defs, _stack=_stack, _depth=_depth, _budget=_budget)
+                    for k, v in node.items()
+                }
             if name in _stack:
                 cycle = " -> ".join([*_stack, name])
                 raise ValueError(
@@ -76,9 +106,15 @@ def _resolve(node: Any, defs: Mapping[str, Any], *, _stack: tuple[str, ...], _de
                     f"$ref expansion exceeded {_MAX_EXPANSION_DEPTH} levels; the schema is "
                     "too deeply chained to inline"
                 )
-            resolved = _resolve(target, defs, _stack=(*_stack, name), _depth=_depth + 1)
+            resolved = _resolve(
+                target,
+                defs,
+                _stack=(*_stack, name),
+                _depth=_depth + 1,
+                _budget=_budget,
+            )
             siblings = {
-                k: _resolve(v, defs, _stack=_stack, _depth=_depth)
+                k: _resolve(v, defs, _stack=_stack, _depth=_depth, _budget=_budget)
                 for k, v in node.items()
                 if k != "$ref"
             }
@@ -87,9 +123,14 @@ def _resolve(node: Any, defs: Mapping[str, Any], *, _stack: tuple[str, ...], _de
             if isinstance(resolved, dict):
                 return {**resolved, **siblings}
             return resolved
-        return {k: _resolve(v, defs, _stack=_stack, _depth=_depth) for k, v in node.items()}
+        return {
+            k: _resolve(v, defs, _stack=_stack, _depth=_depth, _budget=_budget)
+            for k, v in node.items()
+        }
     if isinstance(node, list):
-        return [_resolve(item, defs, _stack=_stack, _depth=_depth) for item in node]
+        return [
+            _resolve(item, defs, _stack=_stack, _depth=_depth, _budget=_budget) for item in node
+        ]
     return node
 
 

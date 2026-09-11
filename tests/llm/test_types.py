@@ -184,7 +184,7 @@ def test_chat_request_accepts_tools_and_tool_choice() -> None:
 
 
 def test_chat_request_accepts_tool_choice_dict_form() -> None:
-    """The specific-tool ``tool_choice`` object passes validation verbatim."""
+    """BR-014 named-tool typing imports and validates across the Python matrix."""
     choice: ToolChoiceFunction = {"type": "function", "function": {"name": "search"}}
     req = ChatRequest(
         messages=[ChatMessage(role="user", content="hi")],

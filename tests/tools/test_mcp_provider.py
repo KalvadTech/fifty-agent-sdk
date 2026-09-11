@@ -211,11 +211,104 @@ def test_schema_translation_defs_cycle_falls_back_to_empty_schema() -> None:
     assert schema.required == []
 
 
+def _exponential_schema(secret: str = "") -> dict[str, Any]:
+    """Build a compact acyclic schema whose inline form grows exponentially."""
+    defs: dict[str, Any] = {"D14": {"type": "string", "description": secret}}
+    for index in range(13, -1, -1):
+        child = {"$ref": f"#/$defs/D{index + 1}"}
+        defs[f"D{index}"] = {"left": child, "right": child}
+    return {
+        "type": "object",
+        "properties": {"payload": {"$ref": "#/$defs/D0"}},
+        "$defs": defs,
+    }
+
+
+def test_schema_translation_over_budget_falls_back_without_logging_schema() -> None:
+    """BR-016 safely rejects over-budget remote schemas without content leakage."""
+    secret = "SCHEMA_SECRET_MUST_NOT_BE_LOGGED"
+    with structlog.testing.capture_logs() as logs:
+        schema = _to_tool_schema(_exponential_schema(secret))
+
+    assert schema.properties == {}
+    failures = [
+        entry for entry in logs if entry.get("event") == "mcp.input_schema.unresolvable_refs"
+    ]
+    assert failures == [
+        {
+            "event": "mcp.input_schema.unresolvable_refs",
+            "reason": "invalid_local_refs",
+            "error_type": "ValueError",
+            "log_level": "warning",
+        }
+    ]
+    assert secret not in repr(logs)
+
+
+def test_schema_translation_deep_ordinary_nesting_falls_back_safely() -> None:
+    """BR-016 raw traversal recursion takes the safe content-free MCP fallback."""
+    secret = "DEEP_SCHEMA_SECRET_MUST_NOT_BE_LOGGED"
+    nested: Any = secret
+    for index in range(1_100):
+        nested = {"level": index, "child": [nested]}
+    input_schema = {"type": "object", "properties": {"payload": nested}}
+
+    with structlog.testing.capture_logs() as logs:
+        schema = _to_tool_schema(input_schema)
+
+    assert schema.properties == {}
+    failures = [
+        entry for entry in logs if entry.get("event") == "mcp.input_schema.unresolvable_refs"
+    ]
+    assert failures == [
+        {
+            "event": "mcp.input_schema.unresolvable_refs",
+            "reason": "invalid_local_refs",
+            "error_type": "ValueError",
+            "log_level": "warning",
+        }
+    ]
+    assert secret not in repr(logs)
+
+
+async def test_attach_continues_after_over_budget_sibling_schema(
+    controllable_server: ControllableServer,
+) -> None:
+    """BR-016 one hostile schema cannot abort discovery of sibling tools."""
+    controllable_server.set_tool_catalog(
+        [
+            _tool_def("hostile", schema=_exponential_schema()),
+            _tool_def(
+                "healthy",
+                schema={"type": "object", "properties": {"q": {"type": "string"}}},
+            ),
+        ]
+    )
+    registry = Registry()
+    await MCPProvider(make_controllable_client(controllable_server)).attach(registry)
+
+    assert registry.get("hostile").schema.properties == {}
+    assert registry.get("healthy").schema.properties == {"q": {"type": "string"}}
+
+
 def test_schema_translation_falls_back_for_non_object_top_level() -> None:
-    schema = _to_tool_schema({"type": "string"})
+    """BR-016 non-object fallback logs type metadata, never remote content."""
+    secret = "REMOTE_TYPE_SECRET_MUST_NOT_BE_LOGGED"
+    with structlog.testing.capture_logs() as logs:
+        schema = _to_tool_schema({"type": secret})
     assert schema.type == "object"
     assert schema.properties == {}
     assert schema.required == []
+    failures = [entry for entry in logs if entry.get("event") == "mcp.input_schema.non_object"]
+    assert failures == [
+        {
+            "event": "mcp.input_schema.non_object",
+            "reason": "non_object_type",
+            "received_type": "str",
+            "log_level": "warning",
+        }
+    ]
+    assert secret not in repr(logs)
 
 
 # ---------------------------------------------------------------------------

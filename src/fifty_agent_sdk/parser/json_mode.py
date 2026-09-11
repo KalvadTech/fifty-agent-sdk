@@ -164,7 +164,10 @@ class JsonModeParser:
                     "cause": repr(depth_err),
                 },
             ) from depth_err
-        except json.JSONDecodeError as first_err:
+        except ValueError as first_err:
+            # CPython also raises bare ValueError for implementation limits
+            # such as oversized integer literals. Keep it in the established
+            # decode phase instead of parsing version-specific error text.
             recovered = _strip_code_fences(completion)
             if recovered is None:
                 raise ParserError(
@@ -188,7 +191,7 @@ class JsonModeParser:
                         "cause": repr(depth_err),
                     },
                 ) from depth_err
-            except json.JSONDecodeError as second_err:
+            except ValueError as second_err:
                 raise ParserError(
                     "could not decode JSON envelope after fence recovery",
                     context={

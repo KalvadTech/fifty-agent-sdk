@@ -139,7 +139,10 @@ class ProseModeParser:
                     "cause": repr(depth_err),
                 },
             ) from depth_err
-        except json.JSONDecodeError as first_err:
+        except ValueError as first_err:
+            # json.loads may raise bare ValueError for interpreter limits
+            # (for example oversized integers). The public contract classifies
+            # every decode failure identically without inspecting error text.
             recovered = _strip_code_fences(body)
             if recovered is None:
                 raise ParserError(
@@ -163,7 +166,7 @@ class ProseModeParser:
                         "cause": repr(depth_err),
                     },
                 ) from depth_err
-            except json.JSONDecodeError as second_err:
+            except ValueError as second_err:
                 raise ParserError(
                     "could not decode Action Input JSON after fence recovery",
                     context={

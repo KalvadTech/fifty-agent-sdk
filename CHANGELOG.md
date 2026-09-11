@@ -15,6 +15,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sending it, letting a provider's own default apply.
 
 ### Fixed
+- Python 3.11 package imports work with the named-tool `tool_choice` form:
+  `TypedDict` now comes from the directly-declared `typing-extensions`
+  dependency, as required by Pydantic on Python versions below 3.12. (BR-014)
+- All five direct `json.loads` boundaries now contain bare `ValueError` as
+  `ParserError` or `LLMError`, including CPython's oversized-integer guard,
+  while preserving the existing malformed-syntax phases, messages, context,
+  and exception chaining. (BR-013)
+- Parser recursion-limit regressions now inject `RecursionError`
+  deterministically instead of relying on interpreter-specific behavior from
+  a 100,000-level JSON value, restoring portable Python 3.14 coverage.
+  (BR-017)
 - **Audit payload shape change (consumer-visible for `AuditSink`
   implementors):** the `tool_invocation` payload's `args` field no longer
   embeds the raw argument dict — it is now per-key metadata (sorted argument
@@ -41,9 +52,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `RedisStateStore` rejects non-positive `ttl_seconds` at construction —
   `ttl_seconds=0` previously made the append's `EXPIRE` delete every session
   key immediately.
-- Redis `switch_branch` and `fork` now preserve the session TTL on the
-  `:active` pointer and `:branches` registry keys, matching the
-  sliding-window model `append` maintains.
+- Every Redis mutation (`append`, `fork`, `switch_branch`, and
+  `truncate_after`) now runs through one optimistic transaction that refreshes
+  every session key to the same sliding TTL. Registry/active/message-key
+  conflicts retry from a fresh snapshot up to a bounded limit, preventing
+  metadata keys from outliving their message lists. (BR-015)
 - The loop rejects `stream=True` combined with `native_tools_enabled` at
   construction instead of misbehaving later.
 - A `RecursionError` from pathologically nested JSON is translated into
@@ -62,7 +75,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Tool schemas sent to the LLM now have `#/$defs` references inlined, so a
   nested `BaseModel` parameter no longer reaches the model as a dangling
   `$ref`; recursive models are rejected at decoration time for `@tool` and
-  fall back to an empty schema for untrusted MCP server schemas.
+  fall back to an empty schema for untrusted MCP server schemas. Expansion is
+  additionally capped at 10,000 total resolver visits, preventing acyclic
+  fan-out from exhausting memory; MCP fallback logs contain only stable
+  reason/type metadata, never remote schema text. (BR-016)
 
 ## [1.5.0] - 2026-07-30
 

@@ -13,9 +13,10 @@ ride along to consumers.
 
 from __future__ import annotations
 
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from typing_extensions import TypedDict
 
 Role = Literal["system", "user", "assistant", "tool"]
 """Discriminator for the speaker of a :class:`ChatMessage`."""

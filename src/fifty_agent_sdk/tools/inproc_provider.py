@@ -225,8 +225,10 @@ def _schema_from_model(model: type[BaseModel]) -> ToolSchema:
     top-level keys), so the refs are INLINED via
     :func:`fifty_agent_sdk.tools._schema_refs.inline_local_refs` — shipping the
     ``$ref`` without its definition would hand the LLM a dangling pointer.
-    A recursive model has no finite inline expansion and is rejected at
-    decoration time with a :class:`ValueError` naming the cycle.
+    Decoration raises :class:`ValueError` when a recursive model has no finite
+    expansion, a reference chain exceeds the depth cap, or expansion exhausts
+    the shared node budget. Cycle failures name the cycle; limit failures carry
+    bounded content-free messages.
     """
     raw = model.model_json_schema()
     defs_raw = raw.get("$defs", {})

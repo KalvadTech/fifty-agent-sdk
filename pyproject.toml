@@ -31,6 +31,9 @@ classifiers = [
 
 dependencies = [
     "pydantic>=2.5.0",
+    # ChatRequest's named-tool choice uses TypedDict. Importing it from
+    # typing_extensions is required by Pydantic on Python 3.11.
+    "typing-extensions>=4.6.1",
     "httpx>=0.26.0",
     "structlog>=24.1.0",
     "openai>=1.30.0,<3.0.0",
