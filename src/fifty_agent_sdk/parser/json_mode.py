@@ -217,7 +217,13 @@ class JsonModeParser:
     def _to_parse_result(self, env: _RawEnvelope, completion: str) -> ParseResult:
         """Convert a validated envelope into the public :data:`ParseResult`."""
         if env.action == "tool":
-            if not env.tool_name:
+            # Strip before the emptiness check (and before emitting the
+            # ToolCall): a whitespace-only name must take the same
+            # schema_validation path as an empty one, and a padded name
+            # must reach the registry in the same stripped form the prose
+            # parser produces (prose_mode strips the Action: header).
+            tool_name = env.tool_name.strip() if env.tool_name is not None else None
+            if not tool_name:
                 raise ParserError(
                     "action='tool' requires non-empty tool_name",
                     context={
@@ -228,7 +234,7 @@ class JsonModeParser:
                     },
                 )
             tool_call = ToolCall(
-                name=env.tool_name,
+                name=tool_name,
                 args=env.tool_args if env.tool_args is not None else {},
             )
             return ThoughtAction(thought=env.thought, tool_call=tool_call)

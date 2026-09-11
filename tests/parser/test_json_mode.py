@@ -161,6 +161,31 @@ def test_action_tool_empty_tool_name_raises() -> None:
     assert excinfo.value.context["missing"] == "tool_name"
 
 
+def test_action_tool_whitespace_only_tool_name_raises() -> None:
+    """A whitespace-only name is blank-after-strip and takes the same
+    schema_validation path as an empty one (the prose parser strips the
+    ``Action:`` header, so the JSON parser must match)."""
+    completion = json.dumps(
+        {"thought": "t", "action": "tool", "tool_name": "   \t  ", "tool_args": {}}
+    )
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["error_phase"] == "schema_validation"
+    assert ctx["missing"] == "tool_name"
+
+
+def test_action_tool_padded_tool_name_is_stripped() -> None:
+    """Surrounding whitespace is stripped so the registry sees the same clean
+    name the prose parser would emit."""
+    completion = json.dumps(
+        {"thought": "t", "action": "tool", "tool_name": "  search  ", "tool_args": {}}
+    )
+    result = _parser().parse(completion)
+    assert isinstance(result, ThoughtAction)
+    assert result.tool_call.name == "search"
+
+
 def test_action_final_missing_answer_raises() -> None:
     completion = json.dumps({"thought": "t", "action": "final"})
     with pytest.raises(ParserError) as excinfo:
