@@ -51,7 +51,9 @@ Audit emission
     When an optional :class:`fifty_agent_sdk.audit.protocol.AuditSink` is wired
     in, the Runner emits an :class:`fifty_agent_sdk.audit.protocol.AuditEvent` at
     four points of every ``run()``: session start, each tool invocation
-    (args plus a bounded result summary), the final answer, and any error.
+    (argument metadata — sorted keys with per-value type names and lengths,
+    never the values — plus a bounded result summary), the final answer,
+    and any error.
 
     Audit emission is best-effort and isolated from the run: a raising
     sink is caught by :meth:`_emit_audit`, logged at ``WARNING`` under the
@@ -118,7 +120,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sized
 from datetime import UTC, datetime
 from typing import Any, Final
 from uuid import uuid4
@@ -165,6 +167,30 @@ def _bounded_repr(value: object) -> str:
     if len(text) <= _RESULT_SUMMARY_CAP:
         return text
     return text[:_RESULT_SUMMARY_CAP] + _TRUNCATION_MARKER
+
+
+def _args_metadata(args: dict[str, Any]) -> dict[str, Any]:
+    """Return a non-content summary of a tool's argument dict.
+
+    Tool args routinely carry secrets and PII, and an audit payload is
+    persisted and logged verbatim (see the "no secrets in the payload"
+    contract on :class:`fifty_agent_sdk.audit.protocol.AuditEvent`), so the
+    ``tool_invocation`` payload MUST NOT embed argument values. The summary
+    keeps the argument keys (sorted, for determinism) and, per key, the
+    value's type name and its length when the value is sized (``len`` is
+    ``None`` otherwise) — enough for shape-level debugging without leaking
+    content. This mirrors the value-replacement discipline of
+    :func:`fifty_agent_sdk.mcp.client._redact_headers`, which keeps header
+    names and drops header values.
+    """
+    summary: dict[str, Any] = {}
+    for key in sorted(args):
+        value = args[key]
+        summary[key] = {
+            "type": type(value).__name__,
+            "len": len(value) if isinstance(value, Sized) else None,
+        }
+    return summary
 
 
 class AgentRunner:
@@ -340,7 +366,9 @@ class AgentRunner:
             event_type: One of ``"session_start"``, ``"tool_invocation"``,
                 ``"final_answer"``, ``"error"``.
             payload: Structured, event-specific detail (lengths/counts and
-                tool metadata only — never message or prompt content).
+                tool metadata only — never message or prompt content, and
+                never tool-argument VALUES: ``tool_invocation`` carries the
+                non-content summary built by :func:`_args_metadata`).
         """
         if self._audit is None:
             return
@@ -408,6 +436,12 @@ class AgentRunner:
         success) or the failure string (on a recoverable failure), capped
         so a large or binary result cannot bloat the audit row.
 
+        ``args`` is NEVER embedded verbatim: argument values routinely carry
+        secrets and PII, and the payload is persisted and logged as-is, so
+        the payload's ``"args"`` field is the non-content summary built by
+        :func:`_args_metadata` (sorted keys, per-value type names and
+        lengths — never values).
+
         Args:
             event: The :class:`ObservationEvent` or :class:`ToolFailedEvent`
                 that ended the tool call.
@@ -427,7 +461,7 @@ class AgentRunner:
         return {
             "tool_name": event.tool_name,
             "call_id": (pending_call.call_id if pending_call is not None else event.call_id),
-            "args": args,
+            "args": _args_metadata(args),
             "outcome": outcome,
             "result_summary": result_summary,
         }

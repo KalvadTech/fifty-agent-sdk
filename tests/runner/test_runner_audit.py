@@ -102,7 +102,9 @@ async def test_tool_invocation_payload_carries_correlation_fields() -> None:
 
     tool_event = next(e for e in spy.events if e.event_type == "tool_invocation")
     assert tool_event.payload["tool_name"] == "search"
-    assert tool_event.payload["args"] == {"q": "weather"}
+    # Args are reduced to non-content metadata: sorted keys, per-value type
+    # and length — never the values themselves.
+    assert tool_event.payload["args"] == {"q": {"type": "str", "len": len("weather")}}
     assert tool_event.payload["outcome"] == "ok"
     assert isinstance(tool_event.payload["call_id"], str)
     assert tool_event.payload["call_id"] != ""
@@ -172,9 +174,9 @@ async def test_multi_tool_run_emits_one_event_per_tool() -> None:
     ]
     tool_events = [e for e in spy.events if e.event_type == "tool_invocation"]
     assert tool_events[0].payload["tool_name"] == "alpha"
-    assert tool_events[0].payload["args"] == {"n": 1}
+    assert tool_events[0].payload["args"] == {"n": {"type": "int", "len": None}}
     assert tool_events[1].payload["tool_name"] == "beta"
-    assert tool_events[1].payload["args"] == {"n": 2}
+    assert tool_events[1].payload["args"] == {"n": {"type": "int", "len": None}}
 
 
 async def test_multi_action_batch_audits_each_call_with_own_args_and_call_id() -> None:
@@ -217,10 +219,48 @@ async def test_multi_action_batch_audits_each_call_with_own_args_and_call_id() -
     tool_events = [e for e in spy.events if e.event_type == "tool_invocation"]
     assert len(tool_events) == 2
     by_tool = {e.payload["tool_name"]: e.payload for e in tool_events}
-    assert by_tool["alpha"]["args"] == {"n": 1}
+    # Correlation is per call; args in the payload are the non-content
+    # metadata summary (see _args_metadata), not the raw values.
+    assert by_tool["alpha"]["args"] == {"n": {"type": "int", "len": None}}
     assert by_tool["alpha"]["call_id"] == call_id_by_tool["alpha"]
-    assert by_tool["beta"]["args"] == {"n": 2}
+    assert by_tool["beta"]["args"] == {"n": {"type": "int", "len": None}}
     assert by_tool["beta"]["call_id"] == call_id_by_tool["beta"]
+
+
+# ---------------------------------------------------------------------------
+# Args redaction — payload never carries argument values
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_invocation_args_never_leak_secret_values() -> None:
+    """A secret-looking arg VALUE never appears in the tool_invocation payload.
+
+    Mirrors the ``"SECRET" not in json.dumps(...)`` redaction-proof pattern
+    of the MCP auth tests: argument values routinely carry credentials and
+    PII, so the payload carries only keys, per-value type names and lengths.
+    """
+    import json
+
+    secret = "SECRET-api-key-DO-NOT-LEAK"
+    registry = Registry()
+    registry.register(FakeTool("auth_call", result=ToolResult(output="ok")))
+    llm = FakeLLMClient(
+        replies=[
+            make_response(tool_json("t", "auth_call", {"token": secret, "retries": 3})),
+            make_response(final_json("done")),
+        ]
+    )
+    spy = SpyAuditSink()
+    runner, _store = make_runner(llm=llm, registry=registry, audit=spy)
+
+    await collect(runner.run("s1", "Hi"))
+
+    tool_event = next(e for e in spy.events if e.event_type == "tool_invocation")
+    assert secret not in json.dumps(tool_event.payload, default=str)
+    assert tool_event.payload["args"] == {
+        "retries": {"type": "int", "len": None},
+        "token": {"type": "str", "len": len(secret)},
+    }
 
 
 # ---------------------------------------------------------------------------
