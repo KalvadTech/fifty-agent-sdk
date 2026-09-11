@@ -30,7 +30,7 @@ from mcp.server.fastmcp import FastMCP
 from fifty_agent_sdk.errors import MCPError
 from fifty_agent_sdk.mcp import MCPClient, MCPClientConfig
 
-from .conftest import MCP_URL, make_compat_client, make_strict_http_client
+from .conftest import MCP_URL, StrictTransportMock, make_compat_client, make_strict_http_client
 
 
 def _config(**overrides: Any) -> MCPClientConfig:
@@ -391,28 +391,64 @@ async def test_cancelled_auth_callable_propagates_cancellation() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_user_agent_header_set_on_request() -> None:
-    """``MCPClientConfig.user_agent`` is set on the owned httpx client."""
+async def test_user_agent_header_set_on_owned_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``MCPClientConfig.user_agent`` reaches the wire on the owned-client path.
 
+    No client is injected, so the transport builds its own
+    ``httpx.AsyncClient`` with the configured ``User-Agent``. The construction
+    is intercepted — the network transport swapped for the strict mock, the
+    headers the transport passes left untouched — and the captured request
+    must carry the configured value. (The previous version of this test
+    injected a client that ALREADY carried the header, so it passed even with
+    the ``user_agent`` plumbing deleted.)
+    """
+    captured: dict[str, str] = {}
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        captured["user-agent"] = request.headers.get("user-agent", "")
+        # Fail fast after capture — we only care about the header.
+        raise httpx.ConnectError("captured")
+
+    mock = StrictTransportMock(capture)
+    real_async_client = httpx.AsyncClient
+
+    def owned_client_factory(**kwargs: Any) -> httpx.AsyncClient:
+        # Keep the timeout/headers the transport passes; swap only the network
+        # transport so the request is capturable without real I/O.
+        kwargs["transport"] = httpx.MockTransport(mock.handle)
+        return real_async_client(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", owned_client_factory)
+
+    client = MCPClient(_config(user_agent="my-agent/2.0"))  # owned-client path
+    with pytest.raises(MCPError):
+        await client.discover()
+    assert mock.observed_requests, "expected the request to reach the mock transport"
+    assert captured["user-agent"] == "my-agent/2.0"
+
+
+async def test_user_agent_not_applied_to_injected_client() -> None:
+    """An injected client's own headers win — ``user_agent`` is NOT applied.
+
+    Documents the injected-client contract: the transport merges only the
+    resolved auth headers onto an externally-provided client, so the
+    ``User-Agent`` the server sees is the injected client's own (here the
+    httpx default), never ``MCPClientConfig.user_agent``.
+    """
     captured: dict[str, str] = {}
 
     def capture(request: httpx.Request) -> httpx.Response:
         captured["user-agent"] = request.headers.get("user-agent", "")
         raise httpx.ConnectError("captured")
 
-    # Inject a client built from our config so the transport sets User-Agent.
-    # We use the strict mock for the transport but build the client ourselves
-    # via the owned-client path by NOT injecting one — instead patch the
-    # transport's httpx client construction is internal, so assert through an
-    # injected client carrying the UA the transport would set.
-    http_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(capture),
-        headers={"User-Agent": "my-agent/2.0"},
-    )
+    http_client, _ = make_strict_http_client(capture)
     client = MCPClient(_config(user_agent="my-agent/2.0"), client=http_client)
     with pytest.raises(MCPError):
         await client.discover()
-    assert captured["user-agent"] == "my-agent/2.0"
+    assert captured["user-agent"] == http_client.headers["user-agent"]
+    assert captured["user-agent"] != "my-agent/2.0"
 
 
 # ---------------------------------------------------------------------------
