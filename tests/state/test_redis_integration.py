@@ -61,7 +61,7 @@ async def store() -> AsyncIterator[RedisStateStore]:
     try:
         yield s
     finally:
-        for session_id in ("s1", "s2", "expiring"):
+        for session_id in ("s1", "s2", "expiring", "branched"):
             await s.delete(session_id)
         await s.aclose()
 
@@ -90,6 +90,25 @@ async def test_redis_ttl_is_set(store: RedisStateStore) -> None:
     await store.append("s1", ChatMessage(role="user", content="a"))
     ttl = await store._client.ttl(f"{_TEST_KEY_PREFIX}s1")
     assert 0 < ttl <= 3600
+
+
+async def test_redis_branch_mutation_synchronizes_all_session_pttls(
+    store: RedisStateStore,
+) -> None:
+    """BR-015 real Redis applies one transaction's TTL to every session key."""
+    await store.append("branched", ChatMessage(role="user", content="a"))
+    branch = await store.fork("branched", from_sequence=1)
+    await store.switch_branch("branched", branch)
+    await store.append("branched", ChatMessage(role="user", content="b"))
+
+    keys = await store._client.keys(f"{_TEST_KEY_PREFIX}branched*")
+    for key in keys:
+        await store._client.pexpire(key, 10_000)
+    await store.switch_branch("branched", "trunk")
+
+    pttls = [int(await store._client.pttl(key)) for key in keys]
+    assert min(pttls) > 3_500_000
+    assert max(pttls) - min(pttls) <= 100
 
 
 async def test_redis_delete_removes_key(store: RedisStateStore) -> None:

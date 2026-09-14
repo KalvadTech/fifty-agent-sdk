@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from typing_extensions import TypedDict
 
 Role = Literal["system", "user", "assistant", "tool"]
 """Discriminator for the speaker of a :class:`ChatMessage`."""
@@ -115,6 +116,24 @@ class Usage(BaseModel):
     total_tokens: int = Field(ge=0)
 
 
+class ToolChoiceFunctionName(TypedDict):
+    """The ``function`` member of :class:`ToolChoiceFunction`."""
+
+    name: str
+
+
+class ToolChoiceFunction(TypedDict):
+    """The specific-tool form of :attr:`ChatRequest.tool_choice`.
+
+    Mirrors the OpenAI ``ChatCompletionNamedToolChoiceParam`` shape —
+    ``{"type": "function", "function": {"name": ...}}`` — and forces the
+    model to call the named function instead of choosing freely.
+    """
+
+    type: Literal["function"]
+    function: ToolChoiceFunctionName
+
+
 class ChatRequest(BaseModel):
     """Provider-agnostic chat-completion request.
 
@@ -122,6 +141,11 @@ class ChatRequest(BaseModel):
         messages: Ordered list of conversation messages.
         model: Model identifier. Adapters may override this with a default.
         temperature: Sampling temperature in ``[0.0, 2.0]``. Default ``0.0``.
+            Set to ``None`` to OMIT the parameter from the request body
+            entirely — for providers/models (e.g. OpenAI's reasoning-model
+            family) that reject a non-default temperature. The default is
+            ``0.0`` (NOT ``None``) so existing callers' wire behavior is
+            unchanged: the key is sent unless explicitly set to ``None``.
         max_tokens: Optional cap on completion tokens. Must be ``>= 1`` if set.
         response_format: Optional provider-format hint. Common values are
             ``{"type": "json_object"}`` or ``{"type": "text"}``. Adapters
@@ -135,10 +159,11 @@ class ChatRequest(BaseModel):
             default) means NO tools are declared and the request wire is
             byte-for-byte the pre-BR-008 shape.
         tool_choice: Optional steering for native tool-calling when
-            :attr:`tools` is set. Common values are ``"auto"`` (the default
-            the adapter emits when this is ``None``), ``"required"``,
-            ``"none"``, or a specific-tool object
-            ``{"type": "function", "function": {"name": ...}}``. Ignored when
+            :attr:`tools` is set. Accepts a mode string — ``"auto"`` (the
+            default the adapter emits when this is ``None``),
+            ``"required"``, or ``"none"`` — or a :class:`ToolChoiceFunction`
+            object ``{"type": "function", "function": {"name": ...}}`` that
+            forces the model to call the named function. Ignored when
             :attr:`tools` is ``None``.
     """
 
@@ -146,11 +171,11 @@ class ChatRequest(BaseModel):
 
     messages: list[ChatMessage]
     model: str
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    temperature: float | None = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1)
     response_format: dict[str, Any] | None = None
     tools: list[dict[str, Any]] | None = None
-    tool_choice: str | None = None
+    tool_choice: str | ToolChoiceFunction | None = None
 
 
 class ChatResponse(BaseModel):
@@ -184,5 +209,7 @@ __all__ = [
     "FinishReason",
     "Role",
     "ToolCall",
+    "ToolChoiceFunction",
+    "ToolChoiceFunctionName",
     "Usage",
 ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -13,6 +14,7 @@ from fifty_agent_sdk.parser import (
     Parser,
     ThoughtAction,
 )
+from fifty_agent_sdk.parser import json_mode as json_mode_module
 from fifty_agent_sdk.parser.json_mode import _RawEnvelope
 from fifty_agent_sdk.prompts import JSON_MODE_OUTPUT_FORMAT
 
@@ -161,6 +163,31 @@ def test_action_tool_empty_tool_name_raises() -> None:
     assert excinfo.value.context["missing"] == "tool_name"
 
 
+def test_action_tool_whitespace_only_tool_name_raises() -> None:
+    """A whitespace-only name is blank-after-strip and takes the same
+    schema_validation path as an empty one (the prose parser strips the
+    ``Action:`` header, so the JSON parser must match)."""
+    completion = json.dumps(
+        {"thought": "t", "action": "tool", "tool_name": "   \t  ", "tool_args": {}}
+    )
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["error_phase"] == "schema_validation"
+    assert ctx["missing"] == "tool_name"
+
+
+def test_action_tool_padded_tool_name_is_stripped() -> None:
+    """Surrounding whitespace is stripped so the registry sees the same clean
+    name the prose parser would emit."""
+    completion = json.dumps(
+        {"thought": "t", "action": "tool", "tool_name": "  search  ", "tool_args": {}}
+    )
+    result = _parser().parse(completion)
+    assert isinstance(result, ThoughtAction)
+    assert result.tool_call.name == "search"
+
+
 def test_action_final_missing_answer_raises() -> None:
     completion = json.dumps({"thought": "t", "action": "final"})
     with pytest.raises(ParserError) as excinfo:
@@ -216,6 +243,94 @@ def test_parser_error_chains_cause_via_raise_from() -> None:
     with pytest.raises(ParserError) as excinfo:
         _parser().parse("not json")
     assert excinfo.value.__cause__ is not None
+
+
+def test_strict_recursion_error_is_translated_to_parser_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BR-017 deterministically pins strict-pass ``RecursionError`` translation."""
+    sentinel = RecursionError("deterministic depth failure")
+    calls = 0
+
+    def raise_recursion(_payload: str) -> object:
+        nonlocal calls
+        calls += 1
+        raise sentinel
+
+    monkeypatch.setattr(json_mode_module.json, "loads", raise_recursion)
+    completion = '{"thought":"t","action":"final","answer":"ok"}'
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["parser"] == "JsonModeParser"
+    assert ctx["error_phase"] == "json_decode"
+    assert "RecursionError" in str(ctx["cause"])
+    assert len(str(ctx["completion_excerpt"])) <= 200
+    assert excinfo.value.__cause__ is sentinel
+    assert calls == 1
+
+
+def test_recovery_recursion_error_is_translated_to_parser_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BR-017 deterministically pins recovery-pass ``RecursionError`` translation."""
+    first = json.JSONDecodeError("strict failed", "prefix", 0)
+    sentinel = RecursionError("deterministic recovery depth failure")
+    errors = iter((first, sentinel))
+    calls = 0
+
+    def raise_scripted(_payload: str) -> object:
+        nonlocal calls
+        calls += 1
+        raise next(errors)
+
+    monkeypatch.setattr(json_mode_module.json, "loads", raise_scripted)
+    completion = 'prefix {"thought":"t","action":"final","answer":"ok"} suffix'
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["error_phase"] == "json_decode"
+    assert "RecursionError" in str(ctx["cause"])
+    assert len(str(ctx["completion_excerpt"])) <= 200
+    assert excinfo.value.__cause__ is sentinel
+    assert calls == 2
+
+
+def test_oversized_integer_strict_decode_is_contained() -> None:
+    """BR-013 contains bare ValueError from strict ``json.loads`` decoding."""
+    digits = "9" * (sys.get_int_max_str_digits() + 1)
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(digits)
+    assert str(excinfo.value) == "could not decode JSON envelope"
+    assert excinfo.value.context["error_phase"] == "json_decode"
+    assert len(str(excinfo.value.context["completion_excerpt"])) <= 200
+    assert type(excinfo.value.__cause__) is ValueError
+
+
+def test_oversized_integer_recovery_decode_is_contained() -> None:
+    """BR-013 contains bare ValueError from the JSON recovery decode."""
+    digits = "9" * (sys.get_int_max_str_digits() + 1)
+    completion = f'prefix {{"thought":"t","action":"final","answer":{digits}}} suffix'
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    assert str(excinfo.value) == "could not decode JSON envelope after fence recovery"
+    assert excinfo.value.context["error_phase"] == "json_decode"
+    assert type(excinfo.value.__cause__) is ValueError
+
+
+def test_malformed_json_preserves_decode_message_and_json_cause() -> None:
+    """BR-013 leaves the common malformed-syntax contract unchanged."""
+    completion = "not json"
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    assert str(excinfo.value) == "could not decode JSON envelope"
+    assert excinfo.value.context == {
+        "parser": "JsonModeParser",
+        "error_phase": "json_decode",
+        "completion_excerpt": completion,
+        "cause": repr(excinfo.value.__cause__),
+    }
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
 
 
 # ---------------------------------------------------------------------- #

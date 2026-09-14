@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import sys
+
 import pytest
 
 from fifty_agent_sdk.errors import ParserError
 from fifty_agent_sdk.parser import FinalAnswer, Parser, ProseModeParser, ThoughtAction
+from fifty_agent_sdk.parser import prose_mode as prose_mode_module
 
 
 def _parser() -> ProseModeParser:
@@ -188,6 +192,94 @@ def test_huge_whitespace_payload_does_not_hang() -> None:
         _parser().parse(payload)
     # whitespace-only triggers the empty_completion guard before regex.
     assert excinfo.value.context["error_phase"] == "empty_completion"
+
+
+def test_strict_action_input_recursion_error_is_translated_to_parser_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BR-017 deterministically pins strict Action Input recursion containment."""
+    sentinel = RecursionError("deterministic depth failure")
+    calls = 0
+
+    def raise_recursion(_payload: str) -> object:
+        nonlocal calls
+        calls += 1
+        raise sentinel
+
+    monkeypatch.setattr(prose_mode_module.json, "loads", raise_recursion)
+    completion = 'Thought: T\nAction: search\nAction Input: {"q":"x"}'
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["parser"] == "ProseModeParser"
+    assert ctx["error_phase"] == "action_input_decode"
+    assert "RecursionError" in str(ctx["cause"])
+    assert len(str(ctx["completion_excerpt"])) <= 200
+    assert excinfo.value.__cause__ is sentinel
+    assert calls == 1
+
+
+def test_recovery_action_input_recursion_error_is_translated_to_parser_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BR-017 deterministically pins recovery Action Input recursion containment."""
+    first = json.JSONDecodeError("strict failed", "fence", 0)
+    sentinel = RecursionError("deterministic recovery depth failure")
+    errors = iter((first, sentinel))
+    calls = 0
+
+    def raise_scripted(_payload: str) -> object:
+        nonlocal calls
+        calls += 1
+        raise next(errors)
+
+    monkeypatch.setattr(prose_mode_module.json, "loads", raise_scripted)
+    completion = 'Thought: T\nAction: search\nAction Input: ```json\n{"q":"x"}\n```'
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    ctx = excinfo.value.context
+    assert ctx["error_phase"] == "action_input_decode"
+    assert "RecursionError" in str(ctx["cause"])
+    assert len(str(ctx["completion_excerpt"])) <= 200
+    assert excinfo.value.__cause__ is sentinel
+    assert calls == 2
+
+
+def test_oversized_integer_action_input_strict_decode_is_contained() -> None:
+    """BR-013 contains strict Action Input bare ValueError."""
+    digits = "9" * (sys.get_int_max_str_digits() + 1)
+    completion = f"Thought: T\nAction: search\nAction Input: {digits}"
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    assert str(excinfo.value) == "could not decode Action Input JSON"
+    assert excinfo.value.context["error_phase"] == "action_input_decode"
+    assert type(excinfo.value.__cause__) is ValueError
+
+
+def test_oversized_integer_action_input_recovery_decode_is_contained() -> None:
+    """BR-013 contains recovery Action Input bare ValueError."""
+    digits = "9" * (sys.get_int_max_str_digits() + 1)
+    completion = f'Thought: T\nAction: search\nAction Input: ```json\n{{"n":{digits}}}\n```'
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    assert str(excinfo.value) == "could not decode Action Input JSON after fence recovery"
+    assert excinfo.value.context["error_phase"] == "action_input_decode"
+    assert type(excinfo.value.__cause__) is ValueError
+
+
+def test_malformed_action_input_preserves_decode_message_and_json_cause() -> None:
+    """BR-013 leaves malformed Action Input syntax behavior unchanged."""
+    completion = "Thought: T\nAction: search\nAction Input: not json"
+    with pytest.raises(ParserError) as excinfo:
+        _parser().parse(completion)
+    assert str(excinfo.value) == "could not decode Action Input JSON"
+    assert excinfo.value.context == {
+        "parser": "ProseModeParser",
+        "error_phase": "action_input_decode",
+        "completion_excerpt": completion,
+        "cause": repr(excinfo.value.__cause__),
+    }
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
 
 
 # ---------------------------------------------------------------------- #

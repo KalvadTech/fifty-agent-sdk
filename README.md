@@ -213,7 +213,7 @@ depends (→):
 legend: ▶ entry   ▢ package   name module   → depends
 ```
 
-## What's new in 1.2.0
+## Highlights
 
 - **branching** — first-class conversation branching on `StateStore`: `fork`, `list_branches`, `switch_branch`, branch-scoped `get_messages(..., branch_id=...)`, plus `BranchInfo` and `TRUNK_BRANCH_ID`. a session is now a tree of branches with an active head, and `append` writes to the active branch (the edit-a-message / regenerate model). implemented across memory, SQL, and Redis backends, data-additive and zero-migration: existing sessions read as the trunk branch. breaking for custom `StateStore` implementations: they must add the new methods.
 - **`StateStore.truncate_after(session_id, sequence, *, branch_id=None)`** — a destructive hard-delete of a branch's tail (messages with sequence > N), for redaction, retention, and rollback. only the target branch's own messages are removed (a `fork`'s inherited prefix is never touched), and it is idempotent: a no-op on an unknown session or branch.

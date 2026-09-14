@@ -16,8 +16,11 @@ fifty-agent-sdk-facing contract the wrapper still owns:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
 
 import httpx
@@ -27,7 +30,7 @@ from mcp.server.fastmcp import FastMCP
 from fifty_agent_sdk.errors import MCPError
 from fifty_agent_sdk.mcp import MCPClient, MCPClientConfig
 
-from .conftest import MCP_URL, make_compat_client, make_strict_http_client
+from .conftest import MCP_URL, StrictTransportMock, make_compat_client, make_strict_http_client
 
 
 def _config(**overrides: Any) -> MCPClientConfig:
@@ -92,6 +95,76 @@ async def test_discover_maps_connect_error_to_mcp_error() -> None:
         await client.discover()
     assert exc.value.context["wrapped"] == "ConnectError"
     assert exc.value.context["method"] == "tools/list"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation leaves inside exception groups (never translated to MCPError)
+# ---------------------------------------------------------------------------
+
+
+def _transport_raising(exc: BaseException) -> Any:
+    """A fake Transport whose connect() raises ``exc`` on __aenter__."""
+
+    class _FailingTransport:
+        def connect(self) -> AbstractAsyncContextManager[Any]:
+            @asynccontextmanager
+            async def _cm() -> AsyncIterator[Any]:
+                raise exc
+                yield  # pragma: no cover — unreachable; keeps this a generator
+
+            return _cm()
+
+    return _FailingTransport()
+
+
+async def test_cancelled_error_leaf_in_exception_group_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CancelledError leaf in a mixed BaseExceptionGroup is re-raised, not
+    translated into MCPError.
+
+    Regression: consumer cancellation racing a real transport error can arrive
+    as ``BaseExceptionGroup([ConnectError, CancelledError])`` out of the anyio
+    task group; translating the group wholesale surfaced
+    ``MCPError("MCP transport error: CancelledError")`` and broke the SDK's
+    cancellation contract. The race itself is impractical to stage, so the
+    mixed group is constructed directly and driven through ``discover``.
+    """
+    race = BaseExceptionGroup("race", [httpx.ConnectError("nope"), asyncio.CancelledError()])
+    client = MCPClient(_config())
+    monkeypatch.setattr(client, "_build_transport", lambda _headers: _transport_raising(race))
+    with pytest.raises(asyncio.CancelledError):
+        await client.discover()
+
+
+async def test_cancelled_error_leaf_in_nested_exception_group_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same guarantee when the CancelledError is buried one group deeper
+    (``_iter_leaf_exceptions`` flattens recursively before classification)."""
+    race = BaseExceptionGroup(
+        "outer",
+        [
+            BaseExceptionGroup("inner", [asyncio.CancelledError()]),
+            httpx.ConnectError("nope"),
+        ],
+    )
+    client = MCPClient(_config())
+    monkeypatch.setattr(client, "_build_transport", lambda _headers: _transport_raising(race))
+    with pytest.raises(asyncio.CancelledError):
+        await client.invoke("search", {"q": "x"})
+
+
+async def test_pure_exception_group_still_translates_to_mcp_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group whose leaves are all plain Exceptions still maps to MCPError."""
+    group = ExceptionGroup("transport", [httpx.ConnectError("nope"), httpx.ReadTimeout("slow")])
+    client = MCPClient(_config())
+    monkeypatch.setattr(client, "_build_transport", lambda _headers: _transport_raising(group))
+    with pytest.raises(MCPError) as exc:
+        await client.discover()
+    assert exc.value.context["wrapped"] == "ConnectError"
 
 
 # ---------------------------------------------------------------------------
@@ -265,33 +338,117 @@ async def test_invalid_auth_callable_return_raises_mcp_error() -> None:
     assert mock.observed_requests == [], "auth must fail before any request"
 
 
+async def test_raising_auth_callable_raises_mcp_error() -> None:
+    """A RAISING auth callable (e.g. token endpoint down) surfaces as MCPError.
+
+    Regression: a bad return TYPE was already validated into MCPError, but an
+    auth callable that raised propagated the raw exception — past the
+    "returns or raises MCPError" contract and into the Registry's
+    non-``AgentSdkError`` branch, which downgrades it to a model-recoverable
+    ``ToolResult(is_error=True)`` instead of the fatal failure it is. The
+    exception TEXT must not leak into the MCPError (an auth error message may
+    carry credential material); only the type name is captured.
+    """
+
+    def _never_called(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("transport should not be invoked")
+
+    http_client, mock = make_strict_http_client(_never_called)
+
+    async def down_token_endpoint() -> dict[str, str]:
+        raise httpx.ConnectError("https://secret-token-endpoint.internal unreachable")
+
+    client = MCPClient(_config(), auth=down_token_endpoint, client=http_client)
+    with pytest.raises(MCPError) as exc:
+        await client.invoke("x", {})
+    assert exc.value.context["wrapped"] == "ConnectError"
+    assert exc.value.context["server_url"] == MCP_URL
+    serialized = json.dumps(exc.value.context, default=str) + exc.value.message
+    assert "secret-token-endpoint" not in serialized
+    assert mock.observed_requests == [], "auth must fail before any request"
+
+
+async def test_cancelled_auth_callable_propagates_cancellation() -> None:
+    """A CancelledError out of the auth callable is NOT translated into
+    MCPError — consumer cancellation must propagate (CancelledError is a
+    BaseException on 3.11+, so the ``except Exception`` guard skips it)."""
+
+    def _never_called(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("transport should not be invoked")
+
+    http_client, _ = make_strict_http_client(_never_called)
+
+    async def cancelled_auth() -> dict[str, str]:
+        raise asyncio.CancelledError
+
+    client = MCPClient(_config(), auth=cancelled_auth, client=http_client)
+    with pytest.raises(asyncio.CancelledError):
+        await client.invoke("x", {})
+
+
 # ---------------------------------------------------------------------------
 # user_agent config field set on the owned httpx client
 # ---------------------------------------------------------------------------
 
 
-async def test_user_agent_header_set_on_request() -> None:
-    """``MCPClientConfig.user_agent`` is set on the owned httpx client."""
+async def test_user_agent_header_set_on_owned_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``MCPClientConfig.user_agent`` reaches the wire on the owned-client path.
 
+    No client is injected, so the transport builds its own
+    ``httpx.AsyncClient`` with the configured ``User-Agent``. The construction
+    is intercepted — the network transport swapped for the strict mock, the
+    headers the transport passes left untouched — and the captured request
+    must carry the configured value. (The previous version of this test
+    injected a client that ALREADY carried the header, so it passed even with
+    the ``user_agent`` plumbing deleted.)
+    """
+    captured: dict[str, str] = {}
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        captured["user-agent"] = request.headers.get("user-agent", "")
+        # Fail fast after capture — we only care about the header.
+        raise httpx.ConnectError("captured")
+
+    mock = StrictTransportMock(capture)
+    real_async_client = httpx.AsyncClient
+
+    def owned_client_factory(**kwargs: Any) -> httpx.AsyncClient:
+        # Keep the timeout/headers the transport passes; swap only the network
+        # transport so the request is capturable without real I/O.
+        kwargs["transport"] = httpx.MockTransport(mock.handle)
+        return real_async_client(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", owned_client_factory)
+
+    client = MCPClient(_config(user_agent="my-agent/2.0"))  # owned-client path
+    with pytest.raises(MCPError):
+        await client.discover()
+    assert mock.observed_requests, "expected the request to reach the mock transport"
+    assert captured["user-agent"] == "my-agent/2.0"
+
+
+async def test_user_agent_not_applied_to_injected_client() -> None:
+    """An injected client's own headers win — ``user_agent`` is NOT applied.
+
+    Documents the injected-client contract: the transport merges only the
+    resolved auth headers onto an externally-provided client, so the
+    ``User-Agent`` the server sees is the injected client's own (here the
+    httpx default), never ``MCPClientConfig.user_agent``.
+    """
     captured: dict[str, str] = {}
 
     def capture(request: httpx.Request) -> httpx.Response:
         captured["user-agent"] = request.headers.get("user-agent", "")
         raise httpx.ConnectError("captured")
 
-    # Inject a client built from our config so the transport sets User-Agent.
-    # We use the strict mock for the transport but build the client ourselves
-    # via the owned-client path by NOT injecting one — instead patch the
-    # transport's httpx client construction is internal, so assert through an
-    # injected client carrying the UA the transport would set.
-    http_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(capture),
-        headers={"User-Agent": "my-agent/2.0"},
-    )
+    http_client, _ = make_strict_http_client(capture)
     client = MCPClient(_config(user_agent="my-agent/2.0"), client=http_client)
     with pytest.raises(MCPError):
         await client.discover()
-    assert captured["user-agent"] == "my-agent/2.0"
+    assert captured["user-agent"] == http_client.headers["user-agent"]
+    assert captured["user-agent"] != "my-agent/2.0"
 
 
 # ---------------------------------------------------------------------------

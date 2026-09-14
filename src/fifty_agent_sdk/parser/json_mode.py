@@ -114,7 +114,10 @@ class JsonModeParser:
 
     * ``error_phase="empty_completion"`` — empty/whitespace-only input.
     * ``error_phase="json_decode"`` — both the strict and the recovery pass
-      failed to produce valid JSON.
+      failed to produce valid JSON, or the input nested deeper than the
+      interpreter recursion limit (``json.loads`` raises
+      :class:`RecursionError` there, translated into :class:`ParserError`
+      so the loop's ``ParserError`` contract holds).
     * ``error_phase="schema_validation"`` — JSON decoded but the envelope
       does not match the schema (unknown key, wrong ``action`` value,
       missing required field for the chosen action).
@@ -140,10 +143,31 @@ class JsonModeParser:
     # ------------------------------------------------------------------ #
 
     def _load_json(self, completion: str) -> Any:
-        """Strict-then-recover JSON decode. Raises on total failure."""
+        """Strict-then-recover JSON decode. Raises on total failure.
+
+        :class:`RecursionError` from a pathologically nested input is caught
+        at BOTH decode attempts and translated into :class:`ParserError`
+        (``error_phase="json_decode"``): the :class:`Parser` protocol mandates
+        ``ParserError`` on malformed input, and the loop catches only
+        ``ParserError`` — a raw ``RecursionError`` would escape the async
+        generator with no ``ErrorEvent`` and no terminal ``FinalEvent``.
+        """
         try:
             return json.loads(completion.strip())
-        except json.JSONDecodeError as first_err:
+        except RecursionError as depth_err:
+            raise ParserError(
+                "could not decode JSON envelope: nesting depth exceeds the recursion limit",
+                context={
+                    "parser": "JsonModeParser",
+                    "error_phase": "json_decode",
+                    "completion_excerpt": completion[:_MAX_EXCERPT],
+                    "cause": repr(depth_err),
+                },
+            ) from depth_err
+        except ValueError as first_err:
+            # CPython also raises bare ValueError for implementation limits
+            # such as oversized integer literals. Keep it in the established
+            # decode phase instead of parsing version-specific error text.
             recovered = _strip_code_fences(completion)
             if recovered is None:
                 raise ParserError(
@@ -157,7 +181,17 @@ class JsonModeParser:
                 ) from first_err
             try:
                 return json.loads(recovered)
-            except json.JSONDecodeError as second_err:
+            except RecursionError as depth_err:
+                raise ParserError(
+                    "could not decode JSON envelope: nesting depth exceeds the recursion limit",
+                    context={
+                        "parser": "JsonModeParser",
+                        "error_phase": "json_decode",
+                        "completion_excerpt": completion[:_MAX_EXCERPT],
+                        "cause": repr(depth_err),
+                    },
+                ) from depth_err
+            except ValueError as second_err:
                 raise ParserError(
                     "could not decode JSON envelope after fence recovery",
                     context={
@@ -186,7 +220,13 @@ class JsonModeParser:
     def _to_parse_result(self, env: _RawEnvelope, completion: str) -> ParseResult:
         """Convert a validated envelope into the public :data:`ParseResult`."""
         if env.action == "tool":
-            if not env.tool_name:
+            # Strip before the emptiness check (and before emitting the
+            # ToolCall): a whitespace-only name must take the same
+            # schema_validation path as an empty one, and a padded name
+            # must reach the registry in the same stripped form the prose
+            # parser produces (prose_mode strips the Action: header).
+            tool_name = env.tool_name.strip() if env.tool_name is not None else None
+            if not tool_name:
                 raise ParserError(
                     "action='tool' requires non-empty tool_name",
                     context={
@@ -197,7 +237,7 @@ class JsonModeParser:
                     },
                 )
             tool_call = ToolCall(
-                name=env.tool_name,
+                name=tool_name,
                 args=env.tool_args if env.tool_args is not None else {},
             )
             return ThoughtAction(thought=env.thought, tool_call=tool_call)

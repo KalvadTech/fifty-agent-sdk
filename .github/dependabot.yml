@@ -16,9 +16,7 @@
 # graph -> Dependabot should list this manifest. If it does not detect the PEP
 # 621 setuptools [project.optional-dependencies] table, nothing here runs and
 # the exact pins freeze silently — which is the exact rot this file exists to
-# prevent. On non-detection, fall back to a manual quarterly bump and record
-# that in the coding_guidelines.md Decisions row, so the obligation survives
-# outside this file.
+# prevent. On non-detection, fall back to a manual quarterly bump.
 
 version: 2
 

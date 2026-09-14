@@ -18,8 +18,16 @@ from __future__ import annotations
 
 import structlog
 
-from fifty_agent_sdk import AuditEvent, AuditSink, Registry, SafetyConfig, ToolResult
-from tests.loop.conftest import FakeLLMClient, FakeTool, make_response
+from fifty_agent_sdk import (
+    ActionEvent,
+    AuditEvent,
+    AuditSink,
+    Registry,
+    SafetyConfig,
+    ToolResult,
+    ToolStartedEvent,
+)
+from tests.loop.conftest import FakeLLMClient, FakeTool, make_multi_tool_response, make_response
 from tests.runner.conftest import collect, final_json, make_runner, tool_json
 
 # ---------------------------------------------------------------------------
@@ -94,7 +102,9 @@ async def test_tool_invocation_payload_carries_correlation_fields() -> None:
 
     tool_event = next(e for e in spy.events if e.event_type == "tool_invocation")
     assert tool_event.payload["tool_name"] == "search"
-    assert tool_event.payload["args"] == {"q": "weather"}
+    # Args are reduced to non-content metadata: sorted keys, per-value type
+    # and length — never the values themselves.
+    assert tool_event.payload["args"] == {"q": {"type": "str", "len": len("weather")}}
     assert tool_event.payload["outcome"] == "ok"
     assert isinstance(tool_event.payload["call_id"], str)
     assert tool_event.payload["call_id"] != ""
@@ -164,9 +174,93 @@ async def test_multi_tool_run_emits_one_event_per_tool() -> None:
     ]
     tool_events = [e for e in spy.events if e.event_type == "tool_invocation"]
     assert tool_events[0].payload["tool_name"] == "alpha"
-    assert tool_events[0].payload["args"] == {"n": 1}
+    assert tool_events[0].payload["args"] == {"n": {"type": "int", "len": None}}
     assert tool_events[1].payload["tool_name"] == "beta"
-    assert tool_events[1].payload["args"] == {"n": 2}
+    assert tool_events[1].payload["args"] == {"n": {"type": "int", "len": None}}
+
+
+async def test_multi_action_batch_audits_each_call_with_own_args_and_call_id() -> None:
+    """A native MultiAction batch emits one tool_invocation per call, each with
+    its OWN args and call_id.
+
+    Regression gate for per-call correlation: the loop's MultiAction branch
+    emits N ActionEvents, then N ToolStartedEvents, then N terminal events —
+    all in call order. The old single-slot correlation gave the FIRST
+    terminal event the LAST call's call_id/args and left every other call
+    with ``args={}``. With per-call-id correlation each invocation's payload
+    carries its own pair.
+    """
+    registry = Registry()
+    registry.register(FakeTool("alpha", result=ToolResult(output="A-result")))
+    registry.register(FakeTool("beta", result=ToolResult(output="B-result")))
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("alpha", {"n": 1}), ("beta", {"n": 2})]),
+            make_response(final_json("done")),
+        ]
+    )
+    spy = SpyAuditSink()
+    runner, _store = make_runner(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=2),
+        audit=spy,
+    )
+
+    events = await collect(runner.run("s1", "Hi"))
+
+    # Sanity: this run really went through the MultiAction batch shape — two
+    # ActionEvents followed by two ToolStartedEvents.
+    actions = [e for e in events if isinstance(e, ActionEvent)]
+    started = [e for e in events if isinstance(e, ToolStartedEvent)]
+    assert len(actions) == len(started) == 2
+
+    call_id_by_tool = {e.tool_name: e.call_id for e in started}
+    tool_events = [e for e in spy.events if e.event_type == "tool_invocation"]
+    assert len(tool_events) == 2
+    by_tool = {e.payload["tool_name"]: e.payload for e in tool_events}
+    # Correlation is per call; args in the payload are the non-content
+    # metadata summary (see _args_metadata), not the raw values.
+    assert by_tool["alpha"]["args"] == {"n": {"type": "int", "len": None}}
+    assert by_tool["alpha"]["call_id"] == call_id_by_tool["alpha"]
+    assert by_tool["beta"]["args"] == {"n": {"type": "int", "len": None}}
+    assert by_tool["beta"]["call_id"] == call_id_by_tool["beta"]
+
+
+# ---------------------------------------------------------------------------
+# Args redaction — payload never carries argument values
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_invocation_args_never_leak_secret_values() -> None:
+    """A secret-looking arg VALUE never appears in the tool_invocation payload.
+
+    Mirrors the ``"SECRET" not in json.dumps(...)`` redaction-proof pattern
+    of the MCP auth tests: argument values routinely carry credentials and
+    PII, so the payload carries only keys, per-value type names and lengths.
+    """
+    import json
+
+    secret = "SECRET-api-key-DO-NOT-LEAK"
+    registry = Registry()
+    registry.register(FakeTool("auth_call", result=ToolResult(output="ok")))
+    llm = FakeLLMClient(
+        replies=[
+            make_response(tool_json("t", "auth_call", {"token": secret, "retries": 3})),
+            make_response(final_json("done")),
+        ]
+    )
+    spy = SpyAuditSink()
+    runner, _store = make_runner(llm=llm, registry=registry, audit=spy)
+
+    await collect(runner.run("s1", "Hi"))
+
+    tool_event = next(e for e in spy.events if e.event_type == "tool_invocation")
+    assert secret not in json.dumps(tool_event.payload, default=str)
+    assert tool_event.payload["args"] == {
+        "retries": {"type": "int", "len": None},
+        "token": {"type": "str", "len": len(secret)},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +316,49 @@ async def test_llm_error_run_emits_session_start_then_error() -> None:
     error_event = next(e for e in spy.events if e.event_type == "error")
     assert error_event.payload["error_type"] == "LLMError"
     assert "run_id" in error_event.payload
+
+
+async def test_fatal_sdk_error_escaping_loop_is_audited() -> None:
+    """An MCPError escaping the loop emits an error audit event, terminates
+    with ``terminated_by="sdk_error"``, and still re-raises to the caller.
+
+    The registry re-raises non-recoverable :class:`AgentSdkError` subclasses
+    untouched, so an MCP transport failure propagates out of the loop as an
+    exception rather than as an ErrorEvent. Before this fix such a run exited
+    invisibly: no error audit event and ``terminated_by="interrupted"``.
+    """
+    import pytest
+
+    from fifty_agent_sdk.errors import MCPError
+
+    registry = Registry()
+    registry.register(
+        FakeTool(
+            "mcp_tool",
+            raises=MCPError("transport down", context={"server_url": "https://mcp.example.com"}),
+        )
+    )
+    llm = FakeLLMClient(replies=[make_response(tool_json("t", "mcp_tool", {}))])
+    spy = SpyAuditSink()
+    runner, store = make_runner(llm=llm, registry=registry, audit=spy)
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(MCPError):
+        await collect(runner.run("s1", "Hi"))
+
+    # The escaped SDK error is audited like any other error.
+    assert [e.event_type for e in spy.events] == ["session_start", "error"]
+    error_event = spy.events[-1]
+    assert error_event.payload["error_type"] == "MCPError"
+    assert "transport down" in error_event.payload["error_message"]
+
+    # The run_completed log attributes the exit to the escaped SDK error.
+    completed = [e for e in logs if e.get("event") == "runner.run_completed"]
+    assert len(completed) == 1
+    assert completed[0]["terminated_by"] == "sdk_error"
+
+    # No assistant message was committed; the durable user message survives.
+    history = await store.get_messages("s1")
+    assert [m.role for m in history] == ["user"]
 
 
 async def test_state_store_error_on_assistant_persist_is_audited() -> None:

@@ -51,7 +51,9 @@ Audit emission
     When an optional :class:`fifty_agent_sdk.audit.protocol.AuditSink` is wired
     in, the Runner emits an :class:`fifty_agent_sdk.audit.protocol.AuditEvent` at
     four points of every ``run()``: session start, each tool invocation
-    (args plus a bounded result summary), the final answer, and any error.
+    (argument metadata — sorted keys with per-value type names and lengths,
+    never the values — plus a bounded result summary), the final answer,
+    and any error.
 
     Audit emission is best-effort and isolated from the run: a raising
     sink is caught by :meth:`_emit_audit`, logged at ``WARNING`` under the
@@ -66,8 +68,9 @@ Observability hooks
     When an optional :class:`fifty_agent_sdk.observability.Hooks` is wired in,
     the Runner fires five of the seven hooks: ``on_run_start`` once at run
     start, ``on_tool_start`` / ``on_tool_end`` per tool invocation,
-    ``on_error`` on a loop or durability failure, and ``on_run_end`` once
-    from the ``finally`` block on EVERY exit path. The remaining two hooks
+    ``on_error`` on a loop-internal, durability, or fatal-SDK-error
+    failure, and ``on_run_end`` once from the ``finally`` block on EVERY
+    exit path. The remaining two hooks
     (``on_iteration``, ``on_llm_call``) are Loop-tier — the consumer must
     wire the SAME :class:`Hooks` instance into :class:`fifty_agent_sdk.loop.
     AgentLoop` as well. The Runner does NOT forward ``hooks`` into the loop;
@@ -98,15 +101,26 @@ Logging
       the load/append calls. A companion ``phase`` field names which
       site failed: ``"load"``, ``"persist_system"``, ``"persist_user"``,
       or ``"persist_assistant"``.
-    * ``"cancelled"`` — caller cancelled the consumer task or broke out
-      of the ``async for`` via ``aclose()``.
+    * ``"cancelled"`` — the consumer task was cancelled while the run was
+      in flight; :class:`asyncio.CancelledError` propagates untouched.
+    * ``"interrupted"`` — fallback for every other exit path not
+      attributable to the categories above: an unexpected non-SDK
+      exception escaping the loop, or the consumer breaking out of the
+      ``async for`` / closing the generator via ``aclose()`` (which
+      surfaces as :class:`GeneratorExit`, not cancellation).
+    * ``"sdk_error"`` — a fatal :class:`fifty_agent_sdk.errors.AgentSdkError`
+      subclass escaped the loop as an exception (for example an
+      :class:`~fifty_agent_sdk.errors.MCPError` re-raised by the tool
+      registry). The Runner audits the error, fires ``on_error``, passes
+      the exception to ``on_run_end``, and re-raises it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections import deque
+from collections.abc import AsyncIterator, Sized
 from datetime import UTC, datetime
 from typing import Any, Final
 from uuid import uuid4
@@ -114,7 +128,7 @@ from uuid import uuid4
 import structlog
 
 from fifty_agent_sdk.audit import AuditEvent, AuditSink
-from fifty_agent_sdk.errors import StateStoreError
+from fifty_agent_sdk.errors import AgentSdkError, StateStoreError
 from fifty_agent_sdk.llm.types import ChatMessage
 from fifty_agent_sdk.loop import AgentLoop
 from fifty_agent_sdk.observability import Hooks
@@ -153,6 +167,30 @@ def _bounded_repr(value: object) -> str:
     if len(text) <= _RESULT_SUMMARY_CAP:
         return text
     return text[:_RESULT_SUMMARY_CAP] + _TRUNCATION_MARKER
+
+
+def _args_metadata(args: dict[str, Any]) -> dict[str, Any]:
+    """Return a non-content summary of a tool's argument dict.
+
+    Tool args routinely carry secrets and PII, and an audit payload is
+    persisted and logged verbatim (see the "no secrets in the payload"
+    contract on :class:`fifty_agent_sdk.audit.protocol.AuditEvent`), so the
+    ``tool_invocation`` payload MUST NOT embed argument values. The summary
+    keeps the argument keys (sorted, for determinism) and, per key, the
+    value's type name and its length when the value is sized (``len`` is
+    ``None`` otherwise) — enough for shape-level debugging without leaking
+    content. This mirrors the value-replacement discipline of
+    :func:`fifty_agent_sdk.mcp.client._redact_headers`, which keeps header
+    names and drops header values.
+    """
+    summary: dict[str, Any] = {}
+    for key in sorted(args):
+        value = args[key]
+        summary[key] = {
+            "type": type(value).__name__,
+            "len": len(value) if isinstance(value, Sized) else None,
+        }
+    return summary
 
 
 class AgentRunner:
@@ -328,7 +366,9 @@ class AgentRunner:
             event_type: One of ``"session_start"``, ``"tool_invocation"``,
                 ``"final_answer"``, ``"error"``.
             payload: Structured, event-specific detail (lengths/counts and
-                tool metadata only — never message or prompt content).
+                tool metadata only — never message or prompt content, and
+                never tool-argument VALUES: ``tool_invocation`` carries the
+                non-content summary built by :func:`_args_metadata`).
         """
         if self._audit is None:
             return
@@ -377,26 +417,37 @@ class AgentRunner:
     @staticmethod
     def _tool_invocation_payload(
         event: ObservationEvent | ToolFailedEvent,
-        pending_action: ActionEvent | None,
+        args: dict[str, Any],
         pending_call: ToolStartedEvent | None,
     ) -> dict[str, Any]:
         """Build the ``payload`` for a ``tool_invocation`` audit event.
 
-        Correlates the terminal tool event with the
-        :class:`ActionEvent` that carried the ``args`` and the
-        :class:`ToolStartedEvent` that carried the ``call_id``. The loop is
-        strictly sequential, so the single pending slots are the correct
-        pair; they are still treated as optional for robustness.
+        ``args`` and ``pending_call`` are the per-call state the event loop
+        correlated under this call's ``call_id``: ``args`` was claimed FIFO
+        from the pending :class:`ActionEvent` queue when the matching
+        :class:`ToolStartedEvent` arrived (an :class:`ActionEvent` carries
+        no ``call_id``; both the single-call branch and the ``MultiAction``
+        batch emit actions and starts in call order), and ``pending_call``
+        is the :class:`ToolStartedEvent` popped under the same key. Both
+        are already resolved per-call by the caller — this function only
+        shapes the payload.
 
         ``result_summary`` is a bounded ``repr`` of the tool's output (on
         success) or the failure string (on a recoverable failure), capped
         so a large or binary result cannot bloat the audit row.
 
+        ``args`` is NEVER embedded verbatim: argument values routinely carry
+        secrets and PII, and the payload is persisted and logged as-is, so
+        the payload's ``"args"`` field is the non-content summary built by
+        :func:`_args_metadata` (sorted keys, per-value type names and
+        lengths — never values).
+
         Args:
             event: The :class:`ObservationEvent` or :class:`ToolFailedEvent`
                 that ended the tool call.
-            pending_action: The most recent :class:`ActionEvent`, if seen.
-            pending_call: The most recent :class:`ToolStartedEvent`, if seen.
+            args: The tool's argument dict, correlated per call; ``{}``
+                when no :class:`ActionEvent` could be claimed for the call.
+            pending_call: The correlated :class:`ToolStartedEvent`, if seen.
 
         Returns:
             The structured ``payload`` dict for the audit event.
@@ -410,7 +461,7 @@ class AgentRunner:
         return {
             "tool_name": event.tool_name,
             "call_id": (pending_call.call_id if pending_call is not None else event.call_id),
-            "args": (pending_action.args if pending_action is not None else {}),
+            "args": _args_metadata(args),
             "outcome": outcome,
             "result_summary": result_summary,
         }
@@ -436,9 +487,18 @@ class AgentRunner:
            parsed text on the safety paths. Otherwise skip — the
            fallback final answer is yielded but not committed.
 
-        On consumer cancellation (the consumer breaks out of the
-        ``async for`` loop): :class:`asyncio.CancelledError` propagates
-        untouched. The user message persisted in step 3 survives; no
+        On consumer cancellation (the consumer task is cancelled):
+        :class:`asyncio.CancelledError` propagates untouched. The user
+        message persisted in step 3 survives; no assistant message is
+        persisted.
+
+        On a fatal :class:`fifty_agent_sdk.errors.AgentSdkError` escaping the
+        loop (for example an :class:`~fifty_agent_sdk.errors.MCPError`
+        re-raised by the tool registry — :meth:`AgentLoop.run` documents
+        that non-recoverable SDK errors propagate): the Runner emits the
+        ``error`` audit event, fires ``on_error`` with the exception,
+        records it for ``on_run_end``, sets ``terminated_by="sdk_error"``,
+        and re-raises so the exception still reaches the caller. No
         assistant message is persisted.
 
         On :class:`fifty_agent_sdk.errors.StateStoreError` raised by the state
@@ -452,12 +512,18 @@ class AgentRunner:
 
         Yields:
             :class:`AgentEvent` values forwarded from the inner
-            :class:`AgentLoop` in monotonic ``sequence`` order. The
-            terminal event is always a :class:`FinalEvent`.
+            :class:`AgentLoop` in monotonic ``sequence`` order. On a clean
+            or loop-internal-failure termination the terminal event is a
+            :class:`FinalEvent`; a fatal :class:`AgentSdkError` escaping the
+            loop ends the stream by raising instead.
 
         Raises:
             fifty_agent_sdk.errors.StateStoreError: If any state-store
                 operation fails. The error is logged before being
+                re-raised.
+            fifty_agent_sdk.errors.AgentSdkError: Any fatal SDK error the
+                loop lets propagate. It is audited, reported to
+                ``on_error``, and passed to ``on_run_end`` before being
                 re-raised.
             asyncio.CancelledError: Propagated untouched from the loop
                 or from the consumer's cancellation.
@@ -474,8 +540,9 @@ class AgentRunner:
                 ``run_id``, ``terminated_by``,
                 ``assistant_message_persisted``, ``event_count``,
                 ``final_event_type``, ``phase``. ``terminated_by`` is one
-                of ``"final_answer"``, ``"error"``,
-                ``"state_store_error"``, or ``"cancelled"``.
+                of ``"final_answer"``, ``"error"``, ``"sdk_error"``,
+                ``"state_store_error"``, ``"cancelled"``, or
+                ``"interrupted"`` (see the module docstring).
             ``runner.persist_failed`` (ERROR): Emitted at each of the four
                 state-store boundaries — load, system-prompt persist, user
                 persist, assistant persist — when the underlying
@@ -536,11 +603,14 @@ class AgentRunner:
         await self._invoke_hook("on_run_start", session_id, user_message)
 
         # Initial value is "interrupted" — neutral and applies to any
-        # unexpected exit path (e.g. an exception escaping the loop that
-        # we did not catch explicitly). The dedicated
+        # unexpected exit path (e.g. a non-SDK exception escaping the loop
+        # that we did not catch explicitly, or the consumer closing the
+        # generator via ``aclose()``). The dedicated
         # ``except asyncio.CancelledError`` branch upgrades this to
         # ``"cancelled"`` ONLY when we can attribute exit to an actual
-        # task/consumer cancellation.
+        # task/consumer cancellation, and the ``except AgentSdkError``
+        # branch upgrades it to ``"sdk_error"`` for a fatal SDK error
+        # escaping the loop.
         terminated_by = "interrupted"
         state_store_error_phase: str | None = None
         saw_error = False
@@ -549,8 +619,9 @@ class AgentRunner:
         event_count = 0
         # `run_error` carries the exception that terminated the run, for the
         # `on_run_end` hook. It is set ONLY by an exception that escaped the
-        # run — a `StateStoreError` from a persist site or a surfaced
-        # `CancelledError`. Typed `BaseException | None` because
+        # run — a `StateStoreError` from a persist site, a fatal
+        # `AgentSdkError` escaping the loop, or a surfaced `CancelledError`.
+        # Typed `BaseException | None` because
         # `asyncio.CancelledError` is a `BaseException`, not an `Exception`.
         # A loop-internal failure surfaces an `ErrorEvent` (not a Python
         # exception) and is reported via `on_error`; for that path
@@ -641,23 +712,25 @@ class AgentRunner:
             # coexist in the prompt; that is intentional.
             loop_messages = list(history)  # defensive copy for the loop
 
-            # Single-slot correlation for `tool_invocation` audit events.
-            # The ReACT loop is strictly sequential — one tool in flight at
-            # a time — so a single pending `ActionEvent` (carries `args`)
-            # and pending `ToolStartedEvent` (carries `call_id`) is
-            # sufficient; the paired Observation/ToolFailed clears them.
+            # Per-call correlation for `tool_invocation` audit events and the
+            # on_tool_start/on_tool_end hooks, keyed by `call_id`. The
+            # MultiAction branch of AgentLoop emits N ActionEvents, then N
+            # ToolStartedEvents, then N terminal events — all in call order —
+            # so single pending slots would mis-correlate a batch (the first
+            # terminal event would inherit the LAST call's pairing).
+            # ActionEvents carry no `call_id`, so their `args` are claimed
+            # FIFO from `pending_actions` as each ToolStartedEvent arrives
+            # (both branches emit actions and starts in call order), then
+            # stored under the started call's `call_id`. The paired terminal
+            # event pops its entry, leaving no residue. The single-call path
+            # is the N=1 case of the same flow and behaves exactly as before.
             # `last_error` holds the most recent ErrorEvent for the error
             # branch below.
-            pending_action: ActionEvent | None = None
-            pending_call: ToolStartedEvent | None = None
+            pending_actions: deque[ActionEvent] = deque()
+            pending_calls: dict[str, ToolStartedEvent] = {}
+            pending_args: dict[str, dict[str, Any]] = {}
+            tool_started_at: dict[str, float] = {}
             last_error: ErrorEvent | None = None
-            # Monotonic stamp set when a `ToolStartedEvent` is seen and
-            # diffed on the terminal tool event for the `on_tool_end`
-            # `duration_ms`. A single slot is sufficient — the ReACT loop
-            # runs one tool at a time — and it lives alongside the existing
-            # `pending_action`/`pending_call` single-slot correlation, not
-            # as a second correlation pass.
-            tool_started_at: float | None = None
 
             async for event in self._loop.run(loop_messages, session_id=session_id):
                 event_count += 1
@@ -668,37 +741,39 @@ class AgentRunner:
                     final_text = event.text
                     raw_final_completion = event.raw_completion
                 elif isinstance(event, ActionEvent):
-                    pending_action = event
+                    pending_actions.append(event)
                 elif isinstance(event, ToolStartedEvent):
-                    pending_call = event
-                    tool_started_at = time.perf_counter()
+                    action = pending_actions.popleft() if pending_actions else None
+                    pending_calls[event.call_id] = event
+                    pending_args[event.call_id] = action.args if action is not None else {}
+                    tool_started_at[event.call_id] = time.perf_counter()
                 yield event
                 # `on_tool_start` fires once the `ToolStartedEvent` is seen;
-                # `args` come from the correlated `pending_action`. Fired
-                # AFTER yielding so consumer delivery is never blocked.
+                # `args` were correlated under this call's `call_id` above.
+                # Fired AFTER yielding so consumer delivery is never blocked.
                 if isinstance(event, ToolStartedEvent):
                     await self._invoke_hook(
                         "on_tool_start",
                         session_id,
                         event.tool_name,
-                        pending_action.args if pending_action is not None else {},
+                        pending_args[event.call_id],
                     )
                 # Emit `tool_invocation` AFTER yielding so consumer event
                 # delivery is never blocked on audit latency.
                 if isinstance(event, ObservationEvent | ToolFailedEvent):
+                    pending_call = pending_calls.pop(event.call_id, None)
+                    args = pending_args.pop(event.call_id, {})
+                    started_at = tool_started_at.pop(event.call_id, None)
                     await self._emit_audit(
                         session_id,
                         "tool_invocation",
-                        self._tool_invocation_payload(event, pending_action, pending_call),
+                        self._tool_invocation_payload(event, args, pending_call),
                     )
-                    # `on_tool_end` fires beside the audit emission, BEFORE
-                    # the pending slots are cleared. `result` is the tool's
-                    # output on success or the failure string on a
-                    # recoverable failure.
+                    # `on_tool_end` fires beside the audit emission. `result`
+                    # is the tool's output on success or the failure string
+                    # on a recoverable failure.
                     tool_duration_ms = (
-                        (time.perf_counter() - tool_started_at) * 1000
-                        if tool_started_at is not None
-                        else 0.0
+                        (time.perf_counter() - started_at) * 1000 if started_at is not None else 0.0
                     )
                     tool_result = (
                         event.result.output if isinstance(event, ObservationEvent) else event.error
@@ -710,9 +785,6 @@ class AgentRunner:
                         tool_result,
                         tool_duration_ms,
                     )
-                    pending_action = None
-                    pending_call = None
-                    tool_started_at = None
 
             # ── PHASE 5: PERSIST ASSISTANT (SUCCESS PATH) ─────────────
             if not saw_error and final_text is not None:
@@ -814,11 +886,43 @@ class AgentRunner:
                         },
                     )
         except asyncio.CancelledError as exc:
-            # Caller cancelled the consumer task (or broke out via
-            # ``aclose()``). Attribute exit to cancellation and let the
-            # exception propagate untouched.
+            # The consumer task was cancelled while the run was in flight.
+            # Attribute exit to cancellation and let the exception propagate
+            # untouched. (``aclose()`` surfaces as GeneratorExit instead and
+            # leaves `terminated_by` at its "interrupted" fallback.)
             terminated_by = "cancelled"
             run_error = exc
+            raise
+        except AgentSdkError as exc:
+            if isinstance(exc, StateStoreError):
+                # Persist-site failures already emitted their `error` audit
+                # event and fired `on_error` at the site; the `finally`
+                # block upgrades `terminated_by` to "state_store_error".
+                raise
+            # A fatal SDK error escaped the loop (e.g. an MCPError re-raised
+            # by the tool registry — AgentLoop.run documents that
+            # non-recoverable SDK errors propagate). Audit it and fire
+            # `on_error` BEFORE re-raising, mirroring the persist-site
+            # convention (the `finally` block must not await the sink while
+            # an exception is in flight); `run_error` hands it to
+            # `on_run_end`.
+            terminated_by = "sdk_error"
+            run_error = exc
+            await self._emit_audit(
+                session_id,
+                "error",
+                {
+                    "run_id": run_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            await self._invoke_hook(
+                "on_error",
+                session_id,
+                exc,
+                {"error_type": type(exc).__name__, **dict(exc.context)},
+            )
             raise
         finally:
             if state_store_error_phase is not None:
@@ -836,9 +940,10 @@ class AgentRunner:
             )
             # `on_run_end` fires on EVERY exit path. `run_error` is
             # non-`None` only for an exception that escaped the run (a
-            # `StateStoreError` or the surfaced `CancelledError`); a
-            # loop-internal `terminated_by == "error"` keeps it `None`
-            # (`on_error` already fired for that). Awaiting a hook in
+            # `StateStoreError`, a fatal `AgentSdkError` from the loop, or
+            # the surfaced `CancelledError`); a loop-internal
+            # `terminated_by == "error"` keeps it `None` (`on_error` already
+            # fired for that). Awaiting a hook in
             # `finally` is safe: `_invoke_hook`/`invoke_hook` swallow every
             # `Exception` and re-raise only `CancelledError`, so a raising
             # `on_run_end` cannot mask an in-flight `StateStoreError`.

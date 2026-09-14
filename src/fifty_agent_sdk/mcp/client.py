@@ -53,7 +53,14 @@ Error contract
     Every public method either returns successfully or raises
     :class:`MCPError`. No ``mcp`` SDK exceptions (``McpError``) and no
     ``httpx`` exceptions leak — they are unwrapped from anyio
-    ``ExceptionGroup``s and translated into :class:`MCPError`. The
+    ``ExceptionGroup``s and translated into :class:`MCPError`. An exception
+    raised by a callable ``auth`` provider (e.g. a token endpoint being down)
+    is translated the same way, with only the exception TYPE captured in
+    ``context`` — never the exception text, which may carry credential
+    material. Cancellation is never translated: a
+    :class:`asyncio.CancelledError` propagates untouched, including when it
+    arrives as a leaf of a mixed ``BaseExceptionGroup`` (cancellation racing
+    a real transport error inside the anyio task group). The
     :class:`fifty_agent_sdk.tools.mcp_provider._MCPToolAdapter` deliberately does
     NOT catch :class:`MCPError` so the
     :class:`fifty_agent_sdk.tools.registry.Registry`'s ``AgentSdkError`` branch
@@ -439,6 +446,10 @@ class MCPClient:
                 or server-returned JSON-RPC error. Also raised with
                 ``message == "MCP client is closed"`` when invoked after
                 :meth:`aclose`.
+            asyncio.CancelledError: Propagates untouched — including when it
+                arrives as a leaf of a mixed anyio ``BaseExceptionGroup``
+                (cancellation racing a real transport error). See
+                :meth:`_mcp_error_from_transport`.
         """
         if self._closed:
             raise MCPError(
@@ -513,6 +524,10 @@ class MCPClient:
                 :meth:`aclose`. A per-call ``isError=True`` result no longer
                 raises — it is returned as a :class:`_MCPCallError` (see
                 ``Returns``).
+            asyncio.CancelledError: Propagates untouched — including when it
+                arrives as a leaf of a mixed anyio ``BaseExceptionGroup``
+                (cancellation racing a real transport error). See
+                :meth:`_mcp_error_from_transport`.
         """
         if self._closed:
             raise MCPError(
@@ -605,7 +620,15 @@ class MCPClient:
             sensitive (used to extend redaction).
 
         Raises:
-            MCPError: When a callable provider returns a non-Mapping value.
+            MCPError: When a callable provider returns a non-Mapping value, or
+                when the callable itself raises (e.g. a token endpoint being
+                down surfacing as :class:`httpx.ConnectError`). A raising
+                callable is translated so the module's "returns or raises
+                MCPError" contract holds; without it the raw exception would
+                reach :class:`fifty_agent_sdk.tools.registry.Registry`'s
+                non-``AgentSdkError`` branch and be DOWNGRADED to a
+                model-recoverable ``ToolResult(is_error=True)`` instead of
+                staying the fatal infrastructure failure it is.
         """
         auth = self._auth
         if auth is None:
@@ -613,7 +636,29 @@ class MCPClient:
         if isinstance(auth, Mapping):
             return auth, frozenset(k.lower() for k in auth)
         # auth is a callable
-        resolved = await auth()
+        try:
+            resolved = await auth()
+        # ``except Exception`` (not bare/BaseException) keeps
+        # ``asyncio.CancelledError`` — a BaseException on 3.11+ — propagating
+        # untouched: consumer cancellation must never be re-labelled as an
+        # auth failure. This is the same classification-ordering rule the
+        # ``on_tool_error`` hook documents.
+        except Exception as exc:
+            # Type name only, never str(exc): an auth error message may echo
+            # endpoint material or credentials, and this module's standing
+            # rule is that such material never reaches an MCPError context.
+            _log.warning(
+                "mcp.auth_callable_failed",
+                server_url=self._config.base_url,
+                error_type=type(exc).__name__,
+            )
+            raise MCPError(
+                f"auth callable raised: {type(exc).__name__}",
+                context={
+                    "server_url": self._config.base_url,
+                    "wrapped": type(exc).__name__,
+                },
+            ) from exc
         if not isinstance(resolved, Mapping):
             raise MCPError(
                 "auth callable must return a Mapping[str, str]",
@@ -693,8 +738,24 @@ class MCPClient:
         (e.g. an ``initialize`` protocol-version failure raised inside the
         task group) is routed through the session mapping. Never carries
         headers.
+
+        Cancellation — re-raised, never translated:
+            A leaf that is a :class:`BaseException` but NOT an
+            :class:`Exception` (:class:`asyncio.CancelledError`,
+            :class:`KeyboardInterrupt`) is re-raised untouched. Such a leaf
+            is reachable when consumer cancellation races a real transport
+            error inside the anyio task group and both arrive wrapped in one
+            ``BaseExceptionGroup``; translating it would surface
+            ``MCPError("MCP transport error: CancelledError")`` and break the
+            SDK's cancellation contract. This is the same
+            classification-ordering rule the ``on_tool_error`` hook documents
+            (and loop.py's classifier follows): cancellation always wins over
+            error translation.
         """
         leaves = _iter_leaf_exceptions(exc)
+        for leaf in leaves:
+            if not isinstance(leaf, Exception):
+                raise leaf
         # Prefer a nested protocol error (a 4xx/handshake failure can surface
         # as an McpError inside the transport task group).
         for leaf in leaves:
@@ -864,12 +925,13 @@ class MCPClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # DELIBERATE DIVERGENCE from `invoke_hook`, which logs `str(exc)`:
-            # a hook screening untrusted server content may embed that content
-            # in its own exception message (`ValueError(f"bad: {content}")`), and
-            # this module's standing rule is that untrusted material never
-            # reaches a log line. Log the exception TYPE only — never its text,
-            # never `content`, never the message.
+            # Same discipline as `invoke_hook` (which now also logs the
+            # exception TYPE only): a hook screening untrusted server content
+            # may embed that content in its own exception message
+            # (`ValueError(f"bad: {content}")`), and this module's standing
+            # rule is that untrusted material never reaches a log line. Log
+            # the exception TYPE only — never its text, never `content`,
+            # never the message.
             _log.warning(
                 "mcp.tool_error_hook_failed",
                 tool_name=tool_name,

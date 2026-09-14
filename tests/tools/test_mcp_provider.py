@@ -91,26 +91,224 @@ def test_schema_translation_identity() -> None:
     assert schema.additionalProperties is False
 
 
-def test_schema_translation_drops_unknown_top_level_keys() -> None:
+def _collect_refs(node: Any) -> list[str]:
+    """Recursively collect every ``$ref`` value in a schema structure."""
+    refs: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                refs.append(value)
+            else:
+                refs.extend(_collect_refs(value))
+    elif isinstance(node, list):
+        for item in node:
+            refs.extend(_collect_refs(item))
+    return refs
+
+
+def test_schema_translation_inlines_defs_and_drops_unknown_top_level_keys() -> None:
+    """``$defs`` is not just dropped: local ``#/$defs/...`` refs are inlined
+    first, so no dangling pointer reaches the LLM-facing schema. Other unknown
+    top-level keys (``examples``, …) are still silently dropped — ToolSchema is
+    ``extra="forbid"``."""
     schema = _to_tool_schema(
         {
             "type": "object",
-            "properties": {},
-            "required": [],
-            "$defs": {"X": {"type": "object"}},
+            "properties": {"addr": {"$ref": "#/$defs/Address"}},
+            "required": ["addr"],
+            "$defs": {
+                "Address": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                }
+            },
             "examples": [{}],
         }
     )
-    # No KeyError; ToolSchema is extra="forbid" so we silently drop the
-    # unknown top-level keys at translation time.
     assert schema.type == "object"
+    assert _collect_refs(schema.properties) == []
+    addr = schema.properties["addr"]
+    assert addr["type"] == "object"
+    assert addr["properties"]["city"] == {"type": "string"}
+    assert addr["required"] == ["city"]
+    assert schema.required == ["addr"]
 
 
-def test_schema_translation_falls_back_for_non_object_top_level() -> None:
-    schema = _to_tool_schema({"type": "string"})
+def test_schema_translation_inlines_nested_defs_recursively() -> None:
+    """A def that itself refs another def must resolve to full depth."""
+    schema = _to_tool_schema(
+        {
+            "type": "object",
+            "properties": {"order": {"$ref": "#/$defs/Order"}},
+            "$defs": {
+                "Order": {
+                    "type": "object",
+                    "properties": {"shipping": {"$ref": "#/$defs/Address"}},
+                },
+                "Address": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    )
+    assert _collect_refs(schema.properties) == []
+    shipping = schema.properties["order"]["properties"]["shipping"]
+    assert shipping["properties"]["city"] == {"type": "string"}
+
+
+def test_schema_translation_ref_sibling_keys_are_preserved() -> None:
+    """Sibling keys next to a ``$ref`` (JSON Schema 2020-12 conjunctive
+    semantics) are merged over the resolved definition, not discarded."""
+    schema = _to_tool_schema(
+        {
+            "type": "object",
+            "properties": {"addr": {"$ref": "#/$defs/Address", "description": "where"}},
+            "$defs": {"Address": {"type": "object", "properties": {}}},
+        }
+    )
+    addr = schema.properties["addr"]
+    assert addr["description"] == "where"
+    assert addr["type"] == "object"
+
+
+def test_schema_translation_leaves_unresolvable_refs_untouched() -> None:
+    """A ref the resolver cannot resolve locally (missing def, external URI)
+    passes through — inlining must not invent information the server schema
+    did not carry."""
+    schema = _to_tool_schema(
+        {
+            "type": "object",
+            "properties": {
+                "x": {"$ref": "#/$defs/Missing"},
+                "y": {"$ref": "https://schemas.example.com/ext"},
+            },
+        }
+    )
+    assert schema.properties["x"]["$ref"] == "#/$defs/Missing"
+    assert schema.properties["y"]["$ref"] == "https://schemas.example.com/ext"
+
+
+def test_schema_translation_defs_cycle_falls_back_to_empty_schema() -> None:
+    """A cyclic server schema (a def that transitively refs itself) has no
+    finite inline expansion; untrusted server data takes the same defensive
+    fallback as a non-object schema rather than aborting discovery."""
+    schema = _to_tool_schema(
+        {
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/Node"}},
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {"child": {"$ref": "#/$defs/Node"}},
+                }
+            },
+        }
+    )
     assert schema.type == "object"
     assert schema.properties == {}
     assert schema.required == []
+
+
+def _exponential_schema(secret: str = "") -> dict[str, Any]:
+    """Build a compact acyclic schema whose inline form grows exponentially."""
+    defs: dict[str, Any] = {"D14": {"type": "string", "description": secret}}
+    for index in range(13, -1, -1):
+        child = {"$ref": f"#/$defs/D{index + 1}"}
+        defs[f"D{index}"] = {"left": child, "right": child}
+    return {
+        "type": "object",
+        "properties": {"payload": {"$ref": "#/$defs/D0"}},
+        "$defs": defs,
+    }
+
+
+def test_schema_translation_over_budget_falls_back_without_logging_schema() -> None:
+    """BR-016 safely rejects over-budget remote schemas without content leakage."""
+    secret = "SCHEMA_SECRET_MUST_NOT_BE_LOGGED"
+    with structlog.testing.capture_logs() as logs:
+        schema = _to_tool_schema(_exponential_schema(secret))
+
+    assert schema.properties == {}
+    failures = [
+        entry for entry in logs if entry.get("event") == "mcp.input_schema.unresolvable_refs"
+    ]
+    assert failures == [
+        {
+            "event": "mcp.input_schema.unresolvable_refs",
+            "reason": "invalid_local_refs",
+            "error_type": "ValueError",
+            "log_level": "warning",
+        }
+    ]
+    assert secret not in repr(logs)
+
+
+def test_schema_translation_deep_ordinary_nesting_falls_back_safely() -> None:
+    """BR-016 raw traversal recursion takes the safe content-free MCP fallback."""
+    secret = "DEEP_SCHEMA_SECRET_MUST_NOT_BE_LOGGED"
+    nested: Any = secret
+    for index in range(1_100):
+        nested = {"level": index, "child": [nested]}
+    input_schema = {"type": "object", "properties": {"payload": nested}}
+
+    with structlog.testing.capture_logs() as logs:
+        schema = _to_tool_schema(input_schema)
+
+    assert schema.properties == {}
+    failures = [
+        entry for entry in logs if entry.get("event") == "mcp.input_schema.unresolvable_refs"
+    ]
+    assert failures == [
+        {
+            "event": "mcp.input_schema.unresolvable_refs",
+            "reason": "invalid_local_refs",
+            "error_type": "ValueError",
+            "log_level": "warning",
+        }
+    ]
+    assert secret not in repr(logs)
+
+
+async def test_attach_continues_after_over_budget_sibling_schema(
+    controllable_server: ControllableServer,
+) -> None:
+    """BR-016 one hostile schema cannot abort discovery of sibling tools."""
+    controllable_server.set_tool_catalog(
+        [
+            _tool_def("hostile", schema=_exponential_schema()),
+            _tool_def(
+                "healthy",
+                schema={"type": "object", "properties": {"q": {"type": "string"}}},
+            ),
+        ]
+    )
+    registry = Registry()
+    await MCPProvider(make_controllable_client(controllable_server)).attach(registry)
+
+    assert registry.get("hostile").schema.properties == {}
+    assert registry.get("healthy").schema.properties == {"q": {"type": "string"}}
+
+
+def test_schema_translation_falls_back_for_non_object_top_level() -> None:
+    """BR-016 non-object fallback logs type metadata, never remote content."""
+    secret = "REMOTE_TYPE_SECRET_MUST_NOT_BE_LOGGED"
+    with structlog.testing.capture_logs() as logs:
+        schema = _to_tool_schema({"type": secret})
+    assert schema.type == "object"
+    assert schema.properties == {}
+    assert schema.required == []
+    failures = [entry for entry in logs if entry.get("event") == "mcp.input_schema.non_object"]
+    assert failures == [
+        {
+            "event": "mcp.input_schema.non_object",
+            "reason": "non_object_type",
+            "received_type": "str",
+            "log_level": "warning",
+        }
+    ]
+    assert secret not in repr(logs)
 
 
 # ---------------------------------------------------------------------------

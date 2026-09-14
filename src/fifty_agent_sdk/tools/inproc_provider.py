@@ -8,7 +8,11 @@ down to writing an annotated ``async def``.
 Rich types are supported via Pydantic's JSON Schema emitter:
 ``int | None``, ``list[str]``, ``dict[str, int]``, ``Literal[...]``,
 ``Enum``, nested ``BaseModel`` — anything Pydantic can validate it can also
-emit a schema for.
+emit a schema for. Nested-model ``#/$defs/...`` references are INLINED into
+the emitted :class:`fifty_agent_sdk.tools.protocol.ToolSchema` (see
+:mod:`fifty_agent_sdk.tools._schema_refs`) so the schema the LLM receives is
+self-contained; a recursive model has no finite inline expansion and is
+rejected at decoration time with a :class:`ValueError`.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from typing import Any, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from pydantic_core import PydanticUndefined
 
+from fifty_agent_sdk.tools._schema_refs import inline_local_refs
 from fifty_agent_sdk.tools.protocol import Tool, ToolResult, ToolSchema
 from fifty_agent_sdk.tools.registry import Registry
 
@@ -110,6 +115,9 @@ def tool(
             ``*args``/``**kwargs``, has a positional-only parameter, or has
             any unannotated parameter. The error message names the offending
             parameter.
+        ValueError: At decoration time if a parameter's model is recursive
+            (a ``$ref`` cycle): recursive models have no finite inline
+            expansion and cannot be emitted as a ``$defs``-free schema.
     """
 
     def decorator(fn: ToolFn) -> Tool:
@@ -210,11 +218,26 @@ def _schema_from_model(model: type[BaseModel]) -> ToolSchema:
     Pydantic emits ``{"type": "object", "properties": {...}, "required": [...]}``
     for a plain model; these pass through. ``additionalProperties`` is forced
     to ``False`` to mirror the model's ``extra="forbid"`` config.
+
+    Nested models come out of Pydantic v2 as ``{"$ref": "#/$defs/Foo"}`` plus
+    a top-level ``$defs`` dict. ``ToolSchema`` has no ``$defs`` slot and the
+    loop ships only the four function-calling fields (providers reject unknown
+    top-level keys), so the refs are INLINED via
+    :func:`fifty_agent_sdk.tools._schema_refs.inline_local_refs` — shipping the
+    ``$ref`` without its definition would hand the LLM a dangling pointer.
+    Decoration raises :class:`ValueError` when a recursive model has no finite
+    expansion, a reference chain exceeds the depth cap, or expansion exhausts
+    the shared node budget. Cycle failures name the cycle; limit failures carry
+    bounded content-free messages.
     """
     raw = model.model_json_schema()
+    defs_raw = raw.get("$defs", {})
+    defs: dict[str, Any] = dict(defs_raw) if isinstance(defs_raw, dict) else {}
     properties_raw = raw.get("properties", {})
     required_raw = raw.get("required", [])
-    properties: dict[str, Any] = properties_raw if isinstance(properties_raw, dict) else {}
+    properties: dict[str, Any] = (
+        inline_local_refs(properties_raw, defs) if isinstance(properties_raw, dict) else {}
+    )
     required: list[str] = list(required_raw) if isinstance(required_raw, list) else []
     return ToolSchema(
         type=str(raw.get("type", "object")),

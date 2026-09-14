@@ -43,7 +43,7 @@ from sqlalchemy import insert, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from fifty_agent_sdk import ChatMessage, StateStore, StateStoreError
+from fifty_agent_sdk import ChatMessage, StateStore, StateStoreError, ToolCall
 from fifty_agent_sdk.state.sql import (
     AgentMessage,
     AgentSession,
@@ -166,7 +166,7 @@ async def test_round_trip_preserves_ordering(store: SqlStateStore) -> None:
 async def test_round_trip_preserves_all_chat_message_fields(
     store: SqlStateStore,
 ) -> None:
-    """All four optional/required ChatMessage fields survive a round-trip."""
+    """All five optional/required ChatMessage fields survive a round-trip."""
     msg = ChatMessage(
         role="tool",
         content="result-body",
@@ -180,16 +180,71 @@ async def test_round_trip_preserves_all_chat_message_fields(
     assert got[0].content == "result-body"
     assert got[0].name == "search"
     assert got[0].tool_call_id == "call-abc"
+    assert got[0].tool_calls is None
+
+
+async def test_round_trip_preserves_tool_calls(store: SqlStateStore) -> None:
+    """A native tool-calling assistant turn round-trips its ``tool_calls``.
+
+    Regression: ``AgentMessage`` used to persist only four of the five
+    :class:`ChatMessage` fields, silently dropping ``tool_calls`` on reload
+    and orphaning the paired ``role="tool"`` reply on session resume.
+    """
+    assistant_turn = ChatMessage(
+        role="assistant",
+        content="",
+        tool_calls=[
+            ToolCall(name="search", args={"q": "x"}, id="call-abc"),
+            ToolCall(name="lookup", args={"id": 7}),
+        ],
+    )
+    tool_reply = ChatMessage(
+        role="tool",
+        content="result-body",
+        name="search",
+        tool_call_id="call-abc",
+    )
+    await store.append("s1", assistant_turn)
+    await store.append("s1", tool_reply)
+
+    got = await store.get_messages("s1")
+    assert got == [assistant_turn, tool_reply]
+    assert got[0].tool_calls is not None
+    assert got[0].tool_calls[0].id == "call-abc"
+    # The pairing key survived the reload: the tool reply still matches the
+    # assistant turn's first native call.
+    assert got[1].tool_call_id == got[0].tool_calls[0].id
+
+
+async def test_legacy_null_tool_calls_reads_back_as_none(
+    store: SqlStateStore, engine: AsyncEngine
+) -> None:
+    """A row with ``tool_calls`` NULL (every pre-column row) reads as None."""
+    await store.append("s1", ChatMessage(role="user", content="seed"))
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(AgentMessage).values(
+                session_id="s1",
+                sequence=2,
+                role="assistant",
+                content="legacy",
+                tool_calls=None,
+            )
+        )
+    got = await store.get_messages("s1")
+    assert [m.content for m in got] == ["seed", "legacy"]
+    assert got[1].tool_calls is None
 
 
 async def test_round_trip_handles_optional_fields_as_none(
     store: SqlStateStore,
 ) -> None:
-    """``name`` and ``tool_call_id`` are nullable and round-trip as None."""
+    """``name``, ``tool_call_id`` and ``tool_calls`` are nullable and round-trip as None."""
     await store.append("s1", ChatMessage(role="user", content="hi"))
     got = await store.get_messages("s1")
     assert got[0].name is None
     assert got[0].tool_call_id is None
+    assert got[0].tool_calls is None
 
 
 async def test_round_trip_allows_empty_content(store: SqlStateStore) -> None:
@@ -667,6 +722,7 @@ def test_metadata_columns_match_schema() -> None:
         "content",
         "name",
         "tool_call_id",
+        "tool_calls",
         "created_at",
     }
     assert {c.name for c in branches.columns} == {

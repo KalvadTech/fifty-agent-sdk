@@ -39,8 +39,11 @@ Failure isolation
     A raising hook never breaks a run. :func:`invoke_hook` catches
     :class:`Exception`, logs a ``WARNING`` (event ``hook.invoke_failed``)
     under the fixed ``fifty_agent_sdk.observability`` logger, and swallows it.
-    :class:`asyncio.CancelledError` is the one exception re-raised
-    untouched so consumer cancellation still propagates.
+    The log line carries the hook name and the exception TYPE only — never
+    ``str(exc)`` — because hook arguments are high-value (user message,
+    ``ChatRequest``, tool args) and a hook may embed them in its own
+    exception message. :class:`asyncio.CancelledError` is the one exception
+    re-raised untouched so consumer cancellation still propagates.
 
 Hot-path latency
     Hooks are awaited INLINE. A slow ``on_iteration`` or ``on_llm_call``
@@ -125,7 +128,9 @@ class Hooks:
             ``duration_ms`` is a monotonic wall measurement of the whole
             run. ``error`` is typed ``BaseException | None`` — non-``None``
             ONLY when an exception terminated the run (a
-            :class:`~fifty_agent_sdk.errors.StateStoreError`, or a surfaced
+            :class:`~fifty_agent_sdk.errors.StateStoreError`, a fatal
+            :class:`~fifty_agent_sdk.errors.AgentSdkError` escaping the loop,
+            or a surfaced
             :class:`asyncio.CancelledError` which is a
             :class:`BaseException`, not an :class:`Exception`, hence the
             wider type). A loop-internal failure surfaces an
@@ -154,9 +159,11 @@ class Hooks:
             tool's start and terminal events. Runner tier.
         on_error: ``(session_id, error, context) -> Any``. Fires on a
             loop-internal failure (a synthesized exception built from the
-            :class:`~fifty_agent_sdk.streaming.ErrorEvent`) and on a state-store
+            :class:`~fifty_agent_sdk.streaming.ErrorEvent`), on a state-store
             durability failure (the caught
-            :class:`~fifty_agent_sdk.errors.StateStoreError`). ``context`` is a
+            :class:`~fifty_agent_sdk.errors.StateStoreError`), and on a fatal
+            :class:`~fifty_agent_sdk.errors.AgentSdkError` escaping the loop
+            (the exception itself, before it is re-raised). ``context`` is a
             structured detail dict. Runner tier.
     """
 
@@ -201,7 +208,10 @@ async def invoke_hook(
       untouched (consumer cancellation must propagate); any other
       :class:`Exception` is logged at ``WARNING`` (event
       ``hook.invoke_failed``) under the ``fifty_agent_sdk.observability`` logger
-      and swallowed — a hook failure NEVER aborts a run.
+      and swallowed — a hook failure NEVER aborts a run. The log line
+      carries the exception TYPE only, never ``str(exc)``: hooks receive
+      high-value objects (the raw user message, the full ``ChatRequest``,
+      tool args) and a hook may embed them in its exception message.
 
     Args:
         hook: The callable to invoke, or ``None`` for a no-op.
@@ -221,11 +231,17 @@ async def invoke_hook(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        # Log the exception TYPE only — never str(exc). Hooks receive
+        # high-value objects (on_run_start gets the raw user_message,
+        # on_llm_call the full ChatRequest, on_tool_start the tool args),
+        # and a hook may embed them in its own exception message
+        # (`ValueError(f"unexpected: {request.messages}")`); logging
+        # str(exc) would dump that content into a WARNING line. This
+        # matches the mcp.client tool-error-hook logging discipline.
         _log.warning(
             "hook.invoke_failed",
             hook_name=hook_name,
             error_type=type(exc).__name__,
-            error_message=str(exc),
         )
 
 

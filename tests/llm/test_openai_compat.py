@@ -7,6 +7,7 @@ makes under the hood. No real network is required.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 import httpx
@@ -16,7 +17,7 @@ from pytest_httpx import HTTPXMock
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.llm.openai_compat import OpenAICompatibleClient
 from fifty_agent_sdk.llm.protocol import LLMClient
-from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ToolCall
+from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ToolCall, ToolChoiceFunction
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -232,6 +233,28 @@ async def test_complete_omits_optional_fields_when_unset(httpx_mock: HTTPXMock) 
     assert "response_format" not in body
 
 
+async def test_build_body_sends_default_temperature(httpx_mock: HTTPXMock) -> None:
+    """The ``0.0`` default IS sent — the key is present unless explicitly ``None``."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request())
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assert body["temperature"] == 0.0
+
+
+async def test_build_body_omits_temperature_when_none(httpx_mock: HTTPXMock) -> None:
+    """``temperature=None`` removes the key entirely (reasoning-model providers)."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(temperature=None))
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assert "temperature" not in body
+
+
 @pytest.mark.parametrize(
     "upstream,expected",
     [
@@ -342,6 +365,33 @@ async def test_complete_malformed_arguments_raises_llm_error(httpx_mock: HTTPXMo
     assert exc.value.__cause__ is not None
 
 
+async def test_complete_oversized_integer_arguments_raise_llm_error(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """BR-013 contains bare ValueError from native tool-call argument decoding."""
+    digits = "9" * (sys.get_int_max_str_digits() + 1)
+    arguments = f'{{"n":{digits}}}'
+    payload = _canonical_response(
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_big",
+                "type": "function",
+                "function": {"name": "calculate", "arguments": arguments},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    with pytest.raises(LLMError) as exc:
+        await client.complete(_basic_request())
+    assert str(exc.value) == "provider tool_call arguments is not valid JSON"
+    assert exc.value.context["type"] == "MalformedResponse"
+    assert exc.value.context["tool_call_id"] == "call_big"
+    assert len(str(exc.value.context["arguments_excerpt"])) <= 200
+    assert type(exc.value.__cause__) is ValueError
+
+
 async def test_complete_non_object_arguments_raises_llm_error(httpx_mock: HTTPXMock) -> None:
     """A non-object JSON `arguments` (e.g. a bare array) is rejected."""
     payload = _canonical_response(
@@ -444,6 +494,23 @@ async def test_build_body_tool_choice_override(httpx_mock: HTTPXMock) -> None:
     assert raw is not None
     body = json.loads(raw.read())
     assert body["tool_choice"] == "required"
+
+
+async def test_build_body_tool_choice_dict_form_on_wire(httpx_mock: HTTPXMock) -> None:
+    """The specific-tool `tool_choice` object is emitted verbatim on the wire."""
+    choice: ToolChoiceFunction = {"type": "function", "function": {"name": "search"}}
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(
+        _basic_request(
+            tools=[{"type": "function", "function": {"name": "search"}}],
+            tool_choice=choice,
+        )
+    )
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assert body["tool_choice"] == {"type": "function", "function": {"name": "search"}}
 
 
 async def test_assistant_tool_calls_envelope_on_wire(httpx_mock: HTTPXMock) -> None:
@@ -790,6 +857,43 @@ async def test_stream_malformed_chunk_raises_llm_error(httpx_mock: HTTPXMock) ->
     with pytest.raises(LLMError):
         async for _ in client.stream(_basic_request()):
             pass
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: aclose() and the async context manager
+# ---------------------------------------------------------------------------
+
+
+async def test_aclose_closes_owned_client() -> None:
+    """An owned client (no injected http_client) is closed by aclose()."""
+    client = _make_client()
+    await client.aclose()
+    assert client._client.is_closed()
+
+
+async def test_aclose_is_idempotent() -> None:
+    """A second ``aclose()`` is a no-op and MUST NOT raise."""
+    client = _make_client()
+    await client.aclose()
+    await client.aclose()
+    assert client._client.is_closed()
+
+
+async def test_aclose_does_not_close_injected_http_client() -> None:
+    """An injected ``http_client`` stays open after aclose() — the caller owns it."""
+    injected = httpx.AsyncClient()
+    client = _make_client(http_client=injected)
+    await client.aclose()
+    assert not injected.is_closed
+    await injected.aclose()
+
+
+async def test_async_context_manager_closes_owned_client_on_exit() -> None:
+    """``async with`` returns the client itself and aclose()s it on exit."""
+    async with _make_client() as client:
+        assert isinstance(client, OpenAICompatibleClient)
+        assert not client._client.is_closed()
+    assert client._client.is_closed()
 
 
 # ---------------------------------------------------------------------------

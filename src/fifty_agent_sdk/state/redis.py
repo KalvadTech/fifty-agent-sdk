@@ -35,21 +35,28 @@ Key layout (BR-004 branching)
     sessions read as the trunk and gain the extra keys only when first forked.
 
 TTL semantics
-    When ``ttl_seconds`` is a positive integer, every :meth:`append` re-issues
+    When ``ttl_seconds`` is a positive integer, every state mutation re-issues
     ``EXPIRE`` across ALL of the session's keys (trunk, every fork list, the
     registry, and the active pointer) so the whole session's expiry window
     slides forward together — a "hot session stays alive" cache, and a fork's
-    parent line never expires out from under it. When ``ttl_seconds`` is
-    ``None`` no ``EXPIRE`` is ever issued and the session is durable until
-    :meth:`delete`. :meth:`get_messages` NEVER sets or refreshes a TTL —
+    parent line never expires out from under it. ``append``, ``fork``,
+    ``switch_branch``, and ``truncate_after`` share one optimistic transaction:
+    registry, active pointer, and message lists are watched, the mutation and
+    every ``EXPIRE`` execute together, and conflicts retry from a fresh snapshot
+    up to a bounded limit. When ``ttl_seconds`` is ``None`` no ``EXPIRE`` is
+    ever issued and the session is durable until :meth:`delete`. A non-positive
+    ``ttl_seconds`` is rejected with
+    :class:`ValueError` at construction: ``EXPIRE`` with ``0`` deletes a key
+    immediately, so accepting it would wipe every session key on the first
+    append. :meth:`get_messages` NEVER sets or refreshes a TTL —
     reading a session does not keep it alive.
 
 Atomicity
-    :meth:`append` issues ``RPUSH`` and (when applicable) ``EXPIRE`` inside a
-    single ``MULTI``/``EXEC`` transaction via a ``transaction=True`` pipeline.
-    A concurrent reader therefore sees either the pre-append or post-append
-    state of the list, never a half-written one — satisfying the
-    :class:`StateStore` ``append``-vs-read atomicity invariant.
+    Every state mutation and its optional whole-session TTL refresh execute in
+    one ``MULTI``/``EXEC`` transaction. Optimistic ``WATCH`` covers the branch
+    registry, active pointer, and all enumerated message lists; sustained
+    contention fails after three attempts through the normal
+    :class:`StateStoreError` wrapping contract.
 
 Error wrapping contract
     Every public method wraps :class:`redis.exceptions.RedisError` (the
@@ -83,14 +90,16 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Final, cast
+from typing import Any, Final, Generic, TypeVar, cast
 
 import structlog
 
 try:
     import redis.asyncio as aioredis
-    from redis.exceptions import RedisError
+    from redis.exceptions import RedisError, WatchError
 except ImportError as exc:  # pragma: no cover - exercised via importlib in tests
     raise ImportError(
         "fifty_agent_sdk.state.redis requires redis-py. Install with: pip install 'fifty-agent-sdk[redis]'"
@@ -126,6 +135,31 @@ backend rejects it with :class:`ValueError`. SDK-generated UUID session ids
 never contain them; hierarchical / tenant-derived ids must avoid them. Memory
 and SQL have no such constraint — they do not derive structured keys.
 """
+
+_MAX_MUTATION_RETRIES: Final[int] = 3
+"""Maximum optimistic-lock attempts for one session mutation (BR-015)."""
+
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _SessionSnapshot:
+    """Consistent session metadata captured under Redis ``WATCH``."""
+
+    exists: bool
+    active: str
+    registry: dict[str, dict[str, Any]]
+    branch_map: dict[str, tuple[str | None, int | None]]
+    keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _MutationPlan(Generic[_T]):
+    """Commands and result prepared from one watched session snapshot."""
+
+    apply: Callable[[Any], None] | None
+    result: _T
+    created_keys: tuple[str, ...] = ()
 
 
 def _now() -> datetime:
@@ -174,16 +208,14 @@ class RedisStateStore:
         order. See the module docstring's "Key layout" section.
 
     TTL model:
-        With a positive ``ttl_seconds`` every :meth:`append` slides the
-        session's expiry window forward (``EXPIRE`` re-issued on each
-        write) — a hot-session cache. With ``ttl_seconds=None`` the list
-        never expires. :meth:`get_messages` never touches the TTL.
+        With a positive ``ttl_seconds`` every successful mutation slides every
+        extant session key's expiry window forward together — a hot-session
+        cache. With ``ttl_seconds=None`` no expiry command is emitted.
+        :meth:`get_messages` never touches the TTL.
 
     Atomicity:
-        :meth:`append` runs ``RPUSH`` + ``EXPIRE`` in a single
-        ``MULTI``/``EXEC`` transaction, so a concurrent reader sees only
-        pre- or post-append state — the :class:`StateStore` atomicity
-        invariant.
+        Mutations and their whole-session TTL refresh run in one watched
+        ``MULTI``/``EXEC`` transaction with bounded conflict retry.
 
     Connection ownership:
         The store owns the connection pool created from the URL.
@@ -246,13 +278,19 @@ class RedisStateStore:
             key_prefix: Namespace prepended to each ``session_id`` to form
                 the Redis key. Defaults to :data:`_DEFAULT_KEY_PREFIX`
                 (``"fifty_agent_sdk:state:"``).
-            ttl_seconds: Per-session time-to-live, in seconds. When a
-                positive integer, every :meth:`append` re-issues an
-                ``EXPIRE`` so the session's expiry window slides forward
-                on each write. When ``None`` (the default), no ``EXPIRE``
-                is ever issued and the session list is durable until
-                :meth:`delete`.
+            ttl_seconds: Per-session time-to-live, in seconds. When positive,
+                every mutation re-issues ``EXPIRE`` across all session keys so
+                the window slides forward as one unit. When ``None`` (the
+                default), no ``EXPIRE`` is issued.
+
+        Raises:
+            ValueError: If ``ttl_seconds`` is not positive. ``EXPIRE``
+                with a non-positive value deletes a key immediately, so
+                accepting ``0`` or less would wipe every session key on
+                the first append.
         """
+        if ttl_seconds is not None and ttl_seconds <= 0:
+            raise ValueError(f"ttl_seconds must be a positive integer or None, got {ttl_seconds!r}")
         # ``decode_responses=True`` makes list members come back as ``str``
         # (rather than ``bytes``), ready to hand straight to
         # ``ChatMessage.model_validate_json``.
@@ -453,14 +491,96 @@ class RedisStateStore:
         keys.extend(self._msgs_key(session_id, fid) for fid in fork_ids if fid != TRUNK_BRANCH_ID)
         return keys
 
-    async def _ensure_trunk(self, session_id: str) -> None:
-        """Idempotently record the trunk in the registry with a creation stamp
-        (lazy, on first fork) via ``HSETNX``."""
-        meta = json.dumps(
-            {"parent_branch_id": None, "forked_from_sequence": None, "created_at": _now_iso()}
+    async def _mutation_snapshot(self, pipe: Any, session_id: str) -> _SessionSnapshot:  # noqa: ANN401
+        """Read and watch every key needed by a session mutation.
+
+        The registry is watched before it is enumerated. Any concurrent fork
+        changes that enumeration and therefore invalidates ``EXEC``. The active
+        pointer and all known message lists are watched as well, making routing,
+        validation, mutation, and the subsequent whole-session TTL refresh one
+        optimistic transaction.
+        """
+        trunk_key = self._msgs_key(session_id, TRUNK_BRANCH_ID)
+        branches_key = self._branches_key(session_id)
+        active_key = self._active_key(session_id)
+        base_keys = (trunk_key, branches_key, active_key)
+        await pipe.watch(*base_keys)
+
+        raw_registry = await pipe.hgetall(branches_key)
+        raw_active = await pipe.get(active_key)
+        exists = bool(await pipe.exists(*base_keys))
+        registry: dict[str, dict[str, Any]] = {
+            str(branch_id): json.loads(meta) for branch_id, meta in raw_registry.items()
+        }
+        if TRUNK_BRANCH_ID not in registry:
+            registry[TRUNK_BRANCH_ID] = {
+                "parent_branch_id": None,
+                "forked_from_sequence": None,
+                "created_at": None,
+            }
+        active = str(raw_active) if raw_active is not None else TRUNK_BRANCH_ID
+        if active not in registry:
+            active = TRUNK_BRANCH_ID
+
+        fork_keys = tuple(
+            self._msgs_key(session_id, branch_id)
+            for branch_id in registry
+            if branch_id != TRUNK_BRANCH_ID
         )
-        await cast(
-            "Any", self._client.hsetnx(self._branches_key(session_id), TRUNK_BRANCH_ID, meta)
+        if fork_keys:
+            await pipe.watch(*fork_keys)
+        keys = tuple(dict.fromkeys((*base_keys, *fork_keys)))
+        return _SessionSnapshot(
+            exists=exists,
+            active=active,
+            registry=registry,
+            branch_map=self._branch_map(registry),
+            keys=keys,
+        )
+
+    async def _mutate_session(
+        self,
+        session_id: str,
+        prepare: Callable[[Any, _SessionSnapshot], Awaitable[_MutationPlan[_T]]],
+    ) -> _T:
+        """Apply one session mutation and slide every session key's TTL atomically.
+
+        A ``WatchError`` retries from a fresh registry/active/key snapshot. The
+        retry count is deliberately bounded so sustained contention surfaces
+        through the existing ``RedisError`` -> ``StateStoreError`` translation.
+        With ``ttl_seconds=None`` the same mutation transaction runs but queues
+        no expiry commands.
+        """
+        last_error: WatchError | None = None
+        for _attempt in range(_MAX_MUTATION_RETRIES):
+            try:
+                pipeline = cast("Any", self._client.pipeline(transaction=True))
+                async with pipeline as pipe:
+                    snapshot = await self._mutation_snapshot(pipe, session_id)
+                    plan = await prepare(pipe, snapshot)
+                    if plan.apply is None:
+                        await pipe.unwatch()
+                        return plan.result
+
+                    pipe.multi()
+                    plan.apply(pipe)
+                    ttl = self._ttl_seconds
+                    if ttl is not None:
+                        ttl_keys = dict.fromkeys((*snapshot.keys, *plan.created_keys))
+                        for key in ttl_keys:
+                            pipe.expire(key, ttl)
+                    await pipe.execute()
+                    return plan.result
+            except WatchError as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _trunk_meta() -> str:
+        """Serialize the lazy trunk-registry entry queued by every write."""
+        return json.dumps(
+            {"parent_branch_id": None, "forked_from_sequence": None, "created_at": _now_iso()}
         )
 
     async def get_messages(
@@ -545,29 +665,26 @@ class RedisStateStore:
         """
         payload = message.model_dump_json()
         try:
-            active = await self._get_active(session_id)
-            # Record the trunk in the registry on first write so the session
-            # durably "exists" even after its trunk list is truncated to empty
-            # (an empty Redis list auto-deletes its key).
-            await self._ensure_trunk(session_id)
-            key = self._msgs_key(session_id, active)
-            ttl = self._ttl_seconds
-            ttl_keys: list[str] = []
-            if ttl is not None:
-                ttl_keys = await self._session_keys(session_id)
-                if key not in ttl_keys:
-                    ttl_keys.append(key)
-            async with self._client.pipeline(transaction=True) as pipe:
-                pipe.rpush(key, payload)
-                if ttl is not None:
-                    for k in ttl_keys:
-                        pipe.expire(k, ttl)
-                await pipe.execute()
+            active = TRUNK_BRANCH_ID
+
+            async def prepare(_pipe: Any, snapshot: _SessionSnapshot) -> _MutationPlan[None]:
+                nonlocal active
+                active = snapshot.active
+                key = self._msgs_key(session_id, active)
+                trunk_meta = self._trunk_meta()
+
+                def apply(pipe: Any) -> None:
+                    pipe.hsetnx(self._branches_key(session_id), TRUNK_BRANCH_ID, trunk_meta)
+                    pipe.rpush(key, payload)
+
+                return _MutationPlan(apply=apply, result=None, created_keys=(key,))
+
+            await self._mutate_session(session_id, prepare)
             _log.debug(
                 "redis_state_store.append",
                 session_id=session_id,
                 branch_id=active,
-                ttl=ttl,
+                ttl=self._ttl_seconds,
             )
         except RedisError as exc:
             raise _wrap_state_store_error(exc, session_id=session_id, operation="append") from exc
@@ -607,38 +724,44 @@ class RedisStateStore:
 
         Records a new entry in the branch-registry hash whose parent is the
         active branch. The new branch's own list is created lazily on its
-        first :meth:`append`. Does NOT change the active head.
+        first :meth:`append`. Does NOT change the active head. The registry
+        write and optional whole-session TTL refresh are one transaction.
 
         Raises:
             ValueError: If the session is unknown, or ``from_sequence`` is
                 outside ``0..head`` of the active branch.
             fifty_agent_sdk.errors.StateStoreError: On backend failure.
         """
+        new_id = uuid.uuid4().hex
         try:
-            if not await self._session_exists(session_id):
-                raise ValueError(f"cannot fork unknown session {session_id!r}")
-            # Stamp the trunk's creation time so list_branches is stable.
-            await self._ensure_trunk(session_id)
-            registry = await self._load_registry(session_id)
-            branch_map = self._branch_map(registry)
-            active = await self._get_active(session_id)
-            if active not in branch_map:
-                active = TRUNK_BRANCH_ID
-            head = await self._materialized_len(session_id, active, branch_map)
-            if not 0 <= from_sequence <= head:
-                raise ValueError(
-                    f"from_sequence={from_sequence} out of range 0..{head} "
-                    f"for active branch {active!r} of session {session_id!r}"
+
+            async def prepare(_pipe: Any, snapshot: _SessionSnapshot) -> _MutationPlan[str]:
+                if not snapshot.exists:
+                    raise ValueError(f"cannot fork unknown session {session_id!r}")
+                head = await self._materialized_len(
+                    session_id, snapshot.active, snapshot.branch_map
                 )
-            new_id = uuid.uuid4().hex
-            meta = json.dumps(
-                {
-                    "parent_branch_id": active,
-                    "forked_from_sequence": from_sequence,
-                    "created_at": _now_iso(),
-                }
-            )
-            await cast("Any", self._client.hset(self._branches_key(session_id), new_id, meta))
+                if not 0 <= from_sequence <= head:
+                    raise ValueError(
+                        f"from_sequence={from_sequence} out of range 0..{head} "
+                        f"for active branch {snapshot.active!r} of session {session_id!r}"
+                    )
+                meta = json.dumps(
+                    {
+                        "parent_branch_id": snapshot.active,
+                        "forked_from_sequence": from_sequence,
+                        "created_at": _now_iso(),
+                    }
+                )
+                trunk_meta = self._trunk_meta()
+
+                def apply(pipe: Any) -> None:
+                    pipe.hsetnx(self._branches_key(session_id), TRUNK_BRANCH_ID, trunk_meta)
+                    pipe.hset(self._branches_key(session_id), new_id, meta)
+
+                return _MutationPlan(apply=apply, result=new_id)
+
+            await self._mutate_session(session_id, prepare)
             _log.debug("redis_state_store.fork", session_id=session_id, branch_id=new_id)
             return new_id
         except RedisError as exc:
@@ -690,21 +813,33 @@ class RedisStateStore:
     async def switch_branch(self, session_id: str, branch_id: str) -> None:
         """Set the session's active head to ``branch_id``.
 
+        The pointer write and optional whole-session TTL refresh are one
+        optimistic transaction, so the pointer cannot outlive its messages.
+
         Raises:
             ValueError: If ``branch_id`` does not exist for this session.
             fifty_agent_sdk.errors.StateStoreError: On backend failure.
         """
         try:
-            if not await self._session_exists(session_id):
-                raise ValueError(
-                    f"branch_id={branch_id!r} does not exist for session {session_id!r}"
+
+            async def prepare(_pipe: Any, snapshot: _SessionSnapshot) -> _MutationPlan[None]:
+                if not snapshot.exists or branch_id not in snapshot.registry:
+                    raise ValueError(
+                        f"branch_id={branch_id!r} does not exist for session {session_id!r}"
+                    )
+                trunk_meta = self._trunk_meta()
+
+                def apply(pipe: Any) -> None:
+                    pipe.hsetnx(self._branches_key(session_id), TRUNK_BRANCH_ID, trunk_meta)
+                    pipe.set(self._active_key(session_id), branch_id)
+
+                return _MutationPlan(
+                    apply=apply,
+                    result=None,
+                    created_keys=(self._active_key(session_id),),
                 )
-            registry = await self._load_registry(session_id)
-            if branch_id not in registry:
-                raise ValueError(
-                    f"branch_id={branch_id!r} does not exist for session {session_id!r}"
-                )
-            await cast("Any", self._client.set(self._active_key(session_id), branch_id))
+
+            await self._mutate_session(session_id, prepare)
             _log.debug(
                 "redis_state_store.switch_branch", session_id=session_id, branch_id=branch_id
             )
@@ -725,28 +860,32 @@ class RedisStateStore:
         is refreshed across all of its keys.
         """
         try:
-            if not await self._session_exists(session_id):
-                return
-            target = branch_id if branch_id is not None else await self._get_active(session_id)
-            registry = await self._load_registry(session_id)
-            if target not in registry:
-                return
-            anchor = registry[target]["forked_from_sequence"] or 0
-            # Own message at index i has materialized sequence anchor + 1 + i;
-            # keep the first ``N - anchor`` (those with sequence <= N).
-            keep = sequence - anchor
-            key = self._msgs_key(session_id, target)
-            ttl = self._ttl_seconds
-            ttl_keys = await self._session_keys(session_id) if ttl is not None else []
-            async with self._client.pipeline(transaction=True) as pipe:
-                if keep <= 0:
-                    pipe.ltrim(key, 1, 0)  # start > end empties the list
-                else:
-                    pipe.ltrim(key, 0, keep - 1)
-                if ttl is not None:
-                    for k in ttl_keys:
-                        pipe.expire(k, ttl)
-                await pipe.execute()
+            target = branch_id or TRUNK_BRANCH_ID
+
+            async def prepare(_pipe: Any, snapshot: _SessionSnapshot) -> _MutationPlan[None]:
+                nonlocal target
+                if not snapshot.exists:
+                    return _MutationPlan(apply=None, result=None)
+                target = branch_id if branch_id is not None else snapshot.active
+                if target not in snapshot.registry:
+                    return _MutationPlan(apply=None, result=None)
+                anchor = snapshot.registry[target]["forked_from_sequence"] or 0
+                # Own message at index i has materialized sequence anchor + 1 + i;
+                # keep the first ``N - anchor`` (those with sequence <= N).
+                keep = sequence - anchor
+                key = self._msgs_key(session_id, target)
+                trunk_meta = self._trunk_meta()
+
+                def apply(pipe: Any) -> None:
+                    pipe.hsetnx(self._branches_key(session_id), TRUNK_BRANCH_ID, trunk_meta)
+                    if keep <= 0:
+                        pipe.ltrim(key, 1, 0)  # start > end empties the list
+                    else:
+                        pipe.ltrim(key, 0, keep - 1)
+
+                return _MutationPlan(apply=apply, result=None)
+
+            await self._mutate_session(session_id, prepare)
             _log.debug(
                 "redis_state_store.truncate_after",
                 session_id=session_id,

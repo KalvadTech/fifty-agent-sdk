@@ -31,6 +31,9 @@ classifiers = [
 
 dependencies = [
     "pydantic>=2.5.0",
+    # ChatRequest's named-tool choice uses TypedDict. Importing it from
+    # typing_extensions is required by Pydantic on Python 3.11.
+    "typing-extensions>=4.6.1",
     "httpx>=0.26.0",
     "structlog>=24.1.0",
     "openai>=1.30.0,<3.0.0",
@@ -128,6 +131,10 @@ exclude = ["tests/", "build/", ".venv/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Pin the fixture loop scope explicitly (TD-004): "function" is pytest-asyncio's
+# current default, and setting it silences the unset-option deprecation warning
+# while pinning the behavior against a future default change.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = ["-v", "--tb=short", "--strict-markers", "--import-mode=importlib"]

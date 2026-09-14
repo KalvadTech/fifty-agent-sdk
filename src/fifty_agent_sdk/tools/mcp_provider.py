@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict
 
 from fifty_agent_sdk.mcp import MCPClient, MCPToolDef
 from fifty_agent_sdk.mcp.client import _MCPCallError
+from fifty_agent_sdk.tools._schema_refs import inline_local_refs
 from fifty_agent_sdk.tools.protocol import ToolResult, ToolSchema
 from fifty_agent_sdk.tools.registry import Registry
 
@@ -88,16 +89,25 @@ def _to_tool_schema(input_schema: dict[str, Any]) -> ToolSchema:
     logs a WARNING — the resulting tool will reject any args via Pydantic
     validation downstream, which is the desired defensive behavior.
 
-    Unknown top-level JSON-Schema keys (``$defs``, ``examples``, …) are
-    dropped: :class:`ToolSchema` is ``extra="forbid"`` and exists to
-    describe the parameter surface the LLM sees, not to round-trip the
-    full JSON-Schema vocabulary.
+    ``$defs`` handling: local ``#/$defs/...`` references inside
+    ``properties`` are INLINED via
+    :func:`fifty_agent_sdk.tools._schema_refs.inline_local_refs` before the
+    ``$defs`` block is discarded — :class:`ToolSchema` is ``extra="forbid"``
+    and provider function-calling envelopes reject unknown top-level keys, so
+    the block cannot be shipped, and keeping a ``$ref`` without it would hand
+    the LLM a dangling pointer. A server schema whose refs cannot be inlined
+    (a reference cycle, an over-deep chain, or an exhausted node budget) takes the same defensive
+    fallback as a non-object schema: WARNING plus an empty object schema.
+    Other unknown top-level JSON-Schema keys (``examples``, …) are still
+    dropped: :class:`ToolSchema` exists to describe the parameter surface the
+    LLM sees, not to round-trip the full JSON-Schema vocabulary.
     """
     raw_type = input_schema.get("type", "object")
     if raw_type != "object":
         _log.warning(
             "mcp.input_schema.non_object",
-            type=raw_type,
+            reason="non_object_type",
+            received_type=type(raw_type).__name__,
         )
         return ToolSchema(
             type="object",
@@ -105,9 +115,29 @@ def _to_tool_schema(input_schema: dict[str, Any]) -> ToolSchema:
             required=[],
             additionalProperties=False,
         )
+    defs_raw = input_schema.get("$defs", {})
+    defs: dict[str, Any] = dict(defs_raw) if isinstance(defs_raw, dict) else {}
     properties_raw = input_schema.get("properties", {})
     required_raw = input_schema.get("required", [])
-    properties: dict[str, Any] = dict(properties_raw) if isinstance(properties_raw, dict) else {}
+    try:
+        properties: dict[str, Any] = (
+            inline_local_refs(properties_raw, defs) if isinstance(properties_raw, dict) else {}
+        )
+    except ValueError as exc:
+        # Untrusted server data takes the defensive fallback rather than
+        # raising out of adapter construction (which would abort the whole
+        # discover/attach batch, not just the offending tool's schema).
+        _log.warning(
+            "mcp.input_schema.unresolvable_refs",
+            reason="invalid_local_refs",
+            error_type=type(exc).__name__,
+        )
+        return ToolSchema(
+            type="object",
+            properties={},
+            required=[],
+            additionalProperties=False,
+        )
     required: list[str] = [str(r) for r in required_raw] if isinstance(required_raw, list) else []
     return ToolSchema(
         type="object",

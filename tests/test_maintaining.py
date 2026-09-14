@@ -31,11 +31,12 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 MAP_PATH: Final[Path] = REPO_ROOT / "MAINTAINING.md"
 
 # A backticked span whose whole content is a repo-relative path under ``src/``
-# or ``tests/``, with an optional ``:<line>`` suffix. MAINTAINING.md carries
-# LOCAL paths only — consumer identities and their file paths live in the
-# private brief tracker, because this repo is public and they are not.
+# or ``tests/``, or a root-level ``*.md`` doc, with an optional ``:<line>``
+# suffix. MAINTAINING.md carries LOCAL paths only — consumer identities and
+# their file paths live in the private brief tracker, because this repo is
+# public and they are not.
 _LOCAL_PATH_IN_BACKTICKS: Final[re.Pattern[str]] = re.compile(
-    r"`((?:src|tests)/[A-Za-z0-9_./-]+?)(?::\d+)?`"
+    r"`((?:src|tests)/[A-Za-z0-9_./-]+?|[A-Za-z0-9_-]+\.md)(?::\d+)?`"
 )
 
 _PREFIX_HINT: Final[str] = (
@@ -91,8 +92,9 @@ def test_every_repo_path_named_by_the_map_exists() -> None:
     cited = sorted({match.group(1) for match in _LOCAL_PATH_IN_BACKTICKS.finditer(text)})
 
     assert cited, (
-        "MAINTAINING.md cites no local src/ or tests/ paths — the map is either empty "
-        "or its paths stopped being backticked, and this check has gone vacuous"
+        "MAINTAINING.md cites no local src/, tests/, or root-level *.md paths — "
+        "the map is either empty or its paths stopped being backticked, and this "
+        "check has gone vacuous"
     )
 
     missing = [rel for rel in cited if not REPO_ROOT.joinpath(rel).exists()]

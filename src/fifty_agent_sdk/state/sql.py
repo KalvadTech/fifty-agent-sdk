@@ -85,6 +85,20 @@ Branching (BR-004) & migration
     :meth:`append` / :meth:`fork`. Review the generated revision before
     applying.
 
+Additive columns & older databases
+    ``agent_messages.tool_calls`` (nullable JSON) was added after the
+    initial schema so native tool-calling assistant turns survive a
+    reload. Like the BR-004 additions it is **additive and zero-loss**:
+    ``alembic revision --autogenerate`` against :data:`sql_metadata`
+    emits a plain ``ADD COLUMN``, and pre-existing rows hold ``NULL``,
+    which :meth:`SqlStateStore.get_messages` maps back to
+    ``tool_calls=None``. The SDK still does NOT own migrations: a
+    database created by an older SDK version simply lacks the column
+    until the consumer applies the additive migration, and the ORM
+    ``SELECT`` names every column explicitly — so upgrade the schema
+    together with the SDK (an unmigrated database fails the read with
+    a wrapped ``OperationalError``, not with silent data loss).
+
 Error wrapping contract
     Every public method wraps :class:`sqlalchemy.exc.SQLAlchemyError`
     (the SQLAlchemy base class) into
@@ -159,7 +173,7 @@ except ImportError as exc:  # pragma: no cover - exercised via importlib in test
     ) from exc
 
 from fifty_agent_sdk.errors import StateStoreError
-from fifty_agent_sdk.llm.types import ChatMessage
+from fifty_agent_sdk.llm.types import ChatMessage, ToolCall
 from fifty_agent_sdk.state.protocol import TRUNK_BRANCH_ID, BranchInfo
 
 _log: Final = structlog.get_logger(__name__)
@@ -270,9 +284,9 @@ class AgentSession(Base):
 class AgentMessage(Base):
     """One persisted :class:`ChatMessage` row.
 
-    Round-trips all four :class:`ChatMessage` fields (``role``,
-    ``content``, ``name``, ``tool_call_id``) plus a per-session
-    ``sequence`` and the surrogate ``id`` primary key. The
+    Round-trips all five :class:`ChatMessage` fields (``role``,
+    ``content``, ``name``, ``tool_call_id``, ``tool_calls``) plus a
+    per-session ``sequence`` and the surrogate ``id`` primary key. The
     ``sequence`` is the durable ordering key; ``id`` is only used for
     row identity.
     """
@@ -342,6 +356,22 @@ class AgentMessage(Base):
 
     tool_call_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     """Optional id echoed back on ``role="tool"`` replies."""
+
+    tool_calls: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+        default=None,
+    )
+    """Native tool invocations carried on an ``assistant`` turn (nullable).
+
+    Holds :class:`ChatMessage.tool_calls` as a list of JSON objects in the
+    same shape the Redis backend persists via ``model_dump_json`` (one
+    ``{"name", "args", "id"}`` object per :class:`ToolCall`), so all three
+    backends round-trip identical payloads. ``JSONB`` on Postgres,
+    JSON-encoded ``TEXT`` on SQLite. ``NULL`` — including every row written
+    before this column existed — reads back as ``tool_calls=None``; see the
+    module docstring's "Additive columns" section for the migration story.
+    """
 
     created_at: Mapped[Any] = mapped_column(
         DateTime(timezone=True),
@@ -669,6 +699,12 @@ class SqlStateStore:
                             content=row.content,
                             name=row.name,
                             tool_call_id=row.tool_call_id,
+                            # NULL (incl. pre-column legacy rows) -> None.
+                            tool_calls=(
+                                [ToolCall.model_validate(tc) for tc in row.tool_calls]
+                                if row.tool_calls is not None
+                                else None
+                            ),
                         )
                     )
                 messages = self._materialize_positional(branch_map, by_branch, target)
@@ -761,6 +797,13 @@ class SqlStateStore:
                         content=message.content,
                         name=message.name,
                         tool_call_id=message.tool_call_id,
+                        # Same JSON shape the Redis backend persists via
+                        # model_dump_json, so all backends agree on the wire.
+                        tool_calls=(
+                            [tc.model_dump(mode="json") for tc in message.tool_calls]
+                            if message.tool_calls is not None
+                            else None
+                        ),
                     )
                 )
                 # commit on session.begin() context exit

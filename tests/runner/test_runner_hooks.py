@@ -37,8 +37,8 @@ from fifty_agent_sdk import (
     StateStoreError,
     ToolResult,
 )
-from fifty_agent_sdk.errors import LLMError
-from tests.loop.conftest import FakeLLMClient, FakeTool, make_response
+from fifty_agent_sdk.errors import LLMError, MCPError
+from tests.loop.conftest import FakeLLMClient, FakeTool, make_multi_tool_response, make_response
 from tests.runner.conftest import collect, final_json, make_runner, tool_json
 
 # ---------------------------------------------------------------------------
@@ -218,6 +218,45 @@ async def test_counting_hooks_multi_tool_run() -> None:
     assert [a[1] for a in rec.args["on_tool_end"]] == ["alpha", "beta"]
 
 
+async def test_multi_action_batch_tool_hooks_carry_per_call_args_and_results() -> None:
+    """A native MultiAction batch correlates each tool hook with its own call.
+
+    Regression gate for per-call correlation: the loop's MultiAction branch
+    emits N ActionEvents, then N ToolStartedEvents, then N terminal events —
+    all in call order. ``on_tool_start`` for the FIRST call must carry the
+    FIRST call's args (the old single-slot correlation handed it the last
+    call's args), and ``on_tool_end`` must pair each tool with its own
+    result and a non-negative duration.
+    """
+    registry = Registry()
+    registry.register(FakeTool("alpha", result=ToolResult(output="A-result")))
+    registry.register(FakeTool("beta", result=ToolResult(output="B-result")))
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("alpha", {"n": 1}), ("beta", {"n": 2})]),
+            make_response(final_json("done")),
+        ]
+    )
+    rec = HookRecorder()
+    runner, _store = make_runner(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=2),
+        hooks=rec.hooks(),
+    )
+
+    await collect(runner.run("s1", "Hi"))
+
+    assert rec.counts["on_tool_start"] == 2
+    assert rec.counts["on_tool_end"] == 2
+    starts = {a[1]: a[2] for a in rec.args["on_tool_start"]}
+    assert starts == {"alpha": {"n": 1}, "beta": {"n": 2}}
+    ends = {a[1]: (a[2], a[3]) for a in rec.args["on_tool_end"]}
+    assert ends["alpha"][0] == "A-result"
+    assert ends["beta"][0] == "B-result"
+    assert all(duration >= 0.0 for _, duration in ends.values())
+
+
 # ---------------------------------------------------------------------------
 # on_run_end — duration + error
 # ---------------------------------------------------------------------------
@@ -260,6 +299,45 @@ async def test_on_error_fires_on_llm_failure() -> None:
     # A loop-internal failure leaves on_run_end's `error` None (Q5).
     assert rec.counts["on_run_end"] == 1
     assert rec.args["on_run_end"][0][2] is None
+
+
+# ---------------------------------------------------------------------------
+# on_error — fatal AgentSdkError escaping the loop
+# ---------------------------------------------------------------------------
+
+
+async def test_on_error_fires_on_fatal_sdk_error_escaping_loop() -> None:
+    """An MCPError escaping the loop fires ``on_error``, is handed to
+    ``on_run_end``, and still re-raises to the caller.
+
+    The registry re-raises non-recoverable :class:`AgentSdkError` subclasses
+    untouched, so the failure arrives as an exception rather than an
+    ErrorEvent. Before this fix the run exited with no ``on_error`` call and
+    ``on_run_end(error=None)``.
+    """
+    registry = Registry()
+    registry.register(
+        FakeTool(
+            "mcp_tool",
+            raises=MCPError("transport down", context={"server_url": "https://mcp.example.com"}),
+        )
+    )
+    llm = FakeLLMClient(replies=[make_response(tool_json("t", "mcp_tool", {}))])
+    rec = HookRecorder()
+    runner, _store = make_runner(llm=llm, registry=registry, hooks=rec.hooks())
+
+    with pytest.raises(MCPError):
+        await collect(runner.run("s1", "Hi"))
+
+    assert rec.counts["on_error"] == 1
+    session_id, error, context = rec.args["on_error"][0]
+    assert session_id == "s1"
+    assert isinstance(error, MCPError)
+    assert context["error_type"] == "MCPError"
+    # The escaping exception is carried to on_run_end (unlike a loop-internal
+    # failure, which leaves it None).
+    assert rec.counts["on_run_end"] == 1
+    assert isinstance(rec.args["on_run_end"][0][2], MCPError)
 
 
 # ---------------------------------------------------------------------------

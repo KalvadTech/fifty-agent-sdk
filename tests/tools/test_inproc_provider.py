@@ -348,3 +348,81 @@ async def test_decorated_callable_preserves_nested_basemodel_instance() -> None:
         "street": "1 Infinite Loop",
         "city": "Cupertino",
     }
+
+
+# ---------------------------------------------------------------------------
+# @tool — nested BaseModel schemas: $defs inlined, no dangling $ref
+# ---------------------------------------------------------------------------
+
+
+def _collect_refs(node: Any) -> list[str]:
+    """Recursively collect every ``$ref`` value in a schema structure."""
+    refs: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                refs.append(value)
+            else:
+                refs.extend(_collect_refs(value))
+    elif isinstance(node, list):
+        for item in node:
+            refs.extend(_collect_refs(item))
+    return refs
+
+
+def test_tool_schema_nested_basemodel_refs_are_inlined() -> None:
+    """A nested BaseModel parameter must not emit a dangling ``$ref``.
+
+    Pydantic v2 emits nested models as ``{"$ref": "#/$defs/Foo"}`` plus a
+    top-level ``$defs``; ``ToolSchema`` has no ``$defs`` slot and the loop
+    ships only the four function-calling fields, so the refs are inlined.
+    """
+
+    @tool()
+    async def lookup(address: _Address) -> str:
+        return address.city
+
+    schema = lookup.schema
+    assert _collect_refs(schema.properties) == []
+    prop = schema.properties["address"]
+    assert prop["type"] == "object"
+    assert prop["properties"]["street"]["type"] == "string"
+    assert prop["properties"]["city"]["type"] == "string"
+    assert schema.required == ["address"]
+
+
+class _Order(BaseModel):
+    """Doubly-nested model: its schema refs ``_Address``, which is itself a
+    def — inlining must recurse through defs, not just expand one level."""
+
+    shipping: _Address
+    qty: int
+
+
+def test_tool_schema_doubly_nested_basemodel_refs_are_inlined() -> None:
+    @tool()
+    async def place(order: _Order) -> str:
+        return order.shipping.city
+
+    schema = place.schema
+    assert _collect_refs(schema.properties) == []
+    shipping = schema.properties["order"]["properties"]["shipping"]
+    assert shipping["properties"]["city"]["type"] == "string"
+
+
+class _Node(BaseModel):
+    """Recursive model: ``children`` refs ``_Node`` itself, so the def has no
+    finite inline expansion."""
+
+    name: str
+    children: list[_Node] = []
+
+
+def test_tool_schema_recursive_model_raises_clear_error() -> None:
+    """A recursive model cannot be inlined; decoration must fail loudly rather
+    than emit a dangling ``$ref``."""
+    with pytest.raises(ValueError, match=r"recursive \$ref cycle"):
+
+        @tool()
+        async def walk(node: _Node) -> int:
+            return 0

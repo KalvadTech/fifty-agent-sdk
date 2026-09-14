@@ -4,6 +4,82 @@ All notable changes to `fifty-agent-sdk` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `OpenAICompatibleClient` gains `aclose()` and async context-manager support,
+  so the underlying httpx client can be disposed deterministically.
+- `ChatRequest.tool_choice` accepts the specific-tool dict form (forcing one
+  named tool), alongside the existing string forms.
+- `temperature=None` omits the parameter from the request body instead of
+  sending it, letting a provider's own default apply.
+
+### Fixed
+- Python 3.11 package imports work with the named-tool `tool_choice` form:
+  `TypedDict` now comes from the directly-declared `typing-extensions`
+  dependency, as required by Pydantic on Python versions below 3.12. (BR-014)
+- All five direct `json.loads` boundaries now contain bare `ValueError` as
+  `ParserError` or `LLMError`, including CPython's oversized-integer guard,
+  while preserving the existing malformed-syntax phases, messages, context,
+  and exception chaining. (BR-013)
+- Parser recursion-limit regressions now inject `RecursionError`
+  deterministically instead of relying on interpreter-specific behavior from
+  a 100,000-level JSON value, restoring portable Python 3.14 coverage.
+  (BR-017)
+- **Audit payload shape change (consumer-visible for `AuditSink`
+  implementors):** the `tool_invocation` payload's `args` field no longer
+  embeds the raw argument dict — it is now per-key metadata (sorted argument
+  keys with each value's type name and length, `len=None` for unsized
+  values), closing a leak of secrets/PII into persisted audit payloads. The
+  `on_tool_start` hook still receives the full args.
+- The runner now correlates tool invocations by `call_id` across
+  `MultiAction` batches — previously the first terminal event inherited the
+  last call's `call_id`/args and every other call was audited with
+  `args={}`.
+- A fatal `AgentSdkError` escaping the loop (e.g. `MCPError`) is now
+  surfaced to hooks and audit before re-raising: the error audit event is
+  emitted, `on_error` fires, and the run records
+  `terminated_by="sdk_error"` instead of exiting as `"interrupted"` with
+  `on_run_end(error=None)`.
+- Hook-failure logs now carry `hook_name` and `error_type` only, never
+  `str(exc)` — a raising hook could previously dump conversation content
+  into a WARNING log line.
+- `SqlStateStore` persists `ChatMessage.tool_calls` (nullable JSON column;
+  JSONB on Postgres), so a persisted native-tool-calling assistant turn no
+  longer loses its `tool_calls` — and orphans the paired `role="tool"`
+  replies — on session resume. Additive, via the existing consumer-owned
+  migration path; the SDK still ships no migrations.
+- `RedisStateStore` rejects non-positive `ttl_seconds` at construction —
+  `ttl_seconds=0` previously made the append's `EXPIRE` delete every session
+  key immediately.
+- Every Redis mutation (`append`, `fork`, `switch_branch`, and
+  `truncate_after`) now runs through one optimistic transaction that refreshes
+  every session key to the same sliding TTL. Registry/active/message-key
+  conflicts retry from a fresh snapshot up to a bounded limit, preventing
+  metadata keys from outliving their message lists. (BR-015)
+- The loop rejects `stream=True` combined with `native_tools_enabled` at
+  construction instead of misbehaving later.
+- A `RecursionError` from pathologically nested JSON is translated into
+  `ParserError` (`error_phase` `json_decode` / `action_input_decode`)
+  instead of escaping the parser contract.
+- The JSON-mode parser strips `tool_name` and rejects a whitespace-only one,
+  which previously produced a `ThoughtAction` the registry could never
+  match.
+- An MCP auth callable that raises (e.g. a down token endpoint) is
+  translated into `MCPError` — only the exception type name is captured,
+  never its text — instead of escaping the MCPError-only contract and being
+  downgraded to a model-recoverable `ToolResult`.
+- A `CancelledError` arriving as a leaf of a mixed transport
+  `BaseExceptionGroup` re-raises untouched instead of being translated into
+  `MCPError`, restoring the cancellation contract.
+- Tool schemas sent to the LLM now have `#/$defs` references inlined, so a
+  nested `BaseModel` parameter no longer reaches the model as a dangling
+  `$ref`; recursive models are rejected at decoration time for `@tool` and
+  fall back to an empty schema for untrusted MCP server schemas. Expansion is
+  additionally capped at 10,000 total resolver visits, preventing acyclic
+  fan-out from exhausting memory; MCP fallback logs contain only stable
+  reason/type metadata, never remote schema text. (BR-016)
+
 ## [1.5.0] - 2026-07-30
 
 ### Added
@@ -217,7 +293,7 @@ extracted with its full commit history from the monorepo it was first built in.
 - Import root is now `fifty_agent_sdk` (was `agent_sdk`).
 - Distributed and published as `fifty-agent-sdk` on PyPI.
 
-## [1.0.0]
+## [1.0.0] - 2026-06-19
 
 Initial production release: custom ReACT loop, JSON-mode tool calling, a
 pluggable LLM client (any OpenAI-compatible endpoint), in-process + MCP tool

@@ -71,6 +71,21 @@ jobs:
         with:
           python-version: "3.12"
 
+      # A mistyped tag would silently publish an artifact whose version does
+      # not match the tag it was released as. Compare refs/tags/vX.Y.Z against
+      # pyproject's project.version BEFORE building, so the failure is cheap
+      # and nothing mismatched reaches the artifact. Skipped on
+      # workflow_dispatch (the ref is a branch, not a tag).
+      - name: Verify tag matches pyproject version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(grep -m1 '^version = ' pyproject.toml | cut -d'\"' -f2)"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match pyproject version ${version}"
+            exit 1
+          fi
+
       - name: Build sdist + wheel
         run: |
           python -m pip install --upgrade pip build

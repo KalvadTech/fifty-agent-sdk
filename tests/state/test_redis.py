@@ -15,8 +15,8 @@ commitments from BR-010:
 * Fresh-list-per-call (the defensive-copy invariant).
 * Idempotent delete; delete is scoped to one session.
 * The configured ``key_prefix`` is applied (default ``fifty_agent_sdk:state:``).
-* TTL is *set* on append when ``ttl_seconds`` is configured, refreshed on
-  every append, and absent when ``ttl_seconds`` is ``None``.
+* Every mutation atomically refreshes all session keys to one sliding TTL;
+  TTL-disabled mode emits no expiry commands.
 * Every backend failure (:class:`redis.exceptions.RedisError`) is wrapped
   into :class:`StateStoreError` with the documented context shape.
 * :class:`RedisStateStore` satisfies the :class:`StateStore` protocol.
@@ -33,12 +33,14 @@ Fixture seam
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
+from typing import Any
 
 import fakeredis
 import pytest
 import pytest_asyncio
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, WatchError
 
 from fifty_agent_sdk import ChatMessage, RedisStateStore, StateStore, StateStoreError
 
@@ -271,6 +273,261 @@ async def test_no_ttl_when_ttl_seconds_is_none(store: RedisStateStore) -> None:
     # Redis returns -1 for a key that exists but has no associated expiry.
     ttl = await store._client.ttl("fifty_agent_sdk:state:s1")
     assert ttl == -1
+
+
+async def test_switch_branch_applies_ttl_to_active_pointer(
+    store_with_ttl: RedisStateStore,
+) -> None:
+    """``switch_branch`` must not leave the ``:active`` pointer without a TTL.
+
+    Regression: the pointer was written with a bare ``SET``, which both
+    stripped any TTL the key already carried and left a first-time key with
+    none — so the active head could outlive the session it belongs to.
+    """
+    await store_with_ttl.append("s1", ChatMessage(role="user", content="a"))
+    branch = await store_with_ttl.fork("s1", from_sequence=1)
+    await store_with_ttl.switch_branch("s1", branch)
+    ttl = await store_with_ttl._client.ttl("fifty_agent_sdk:state:s1:active")
+    assert 0 < ttl <= 3600
+    # Switching back re-applies the TTL just the same.
+    await store_with_ttl.switch_branch("s1", "trunk")
+    ttl = await store_with_ttl._client.ttl("fifty_agent_sdk:state:s1:active")
+    assert 0 < ttl <= 3600
+
+
+async def test_switch_branch_without_ttl_leaves_pointer_durable(
+    store: RedisStateStore,
+) -> None:
+    """With ``ttl_seconds=None`` the ``:active`` pointer gets no expiry."""
+    await store.append("s1", ChatMessage(role="user", content="a"))
+    branch = await store.fork("s1", from_sequence=1)
+    await store.switch_branch("s1", branch)
+    ttl = await store._client.ttl("fifty_agent_sdk:state:s1:active")
+    assert ttl == -1
+
+
+async def test_fork_applies_ttl_to_branches_registry(
+    store_with_ttl: RedisStateStore,
+) -> None:
+    """Forking a pre-BR-004 session gives the new ``:branches`` hash the TTL.
+
+    Regression: the registry hash was created via HSETNX/HSET with no
+    ``EXPIRE``, so forking a legacy single-list session (whose bare list
+    predates the registry) left the registry durable while the rest of the
+    session expired.
+    """
+    # Pre-BR-004 layout: a bare message list with no registry hash.
+    await store_with_ttl._client.rpush(
+        "fifty_agent_sdk:state:legacy",
+        ChatMessage(role="user", content="old").model_dump_json(),
+    )
+    await store_with_ttl.fork("legacy", from_sequence=1)
+    ttl = await store_with_ttl._client.ttl("fifty_agent_sdk:state:legacy:branches")
+    assert 0 < ttl <= 3600
+
+
+async def _session_pttls(store: RedisStateStore, session_id: str) -> list[int]:
+    keys = await store._client.keys(f"fifty_agent_sdk:state:{session_id}*")
+    return [int(await store._client.pttl(key)) for key in keys]
+
+
+def _assert_synchronized_ttls(ttls: list[int]) -> None:
+    assert ttls
+    assert min(ttls) > 3_500_000
+    assert max(ttls) - min(ttls) <= 100
+
+
+async def _seed_branched_session(store: RedisStateStore) -> str:
+    await store.append("sync", ChatMessage(role="user", content="trunk"))
+    branch = await store.fork("sync", from_sequence=1)
+    await store.switch_branch("sync", branch)
+    await store.append("sync", ChatMessage(role="user", content="fork"))
+    return branch
+
+
+async def _shorten_session_ttls(store: RedisStateStore) -> None:
+    keys = await store._client.keys("fifty_agent_sdk:state:sync*")
+    for key in keys:
+        await store._client.pexpire(key, 10_000)
+
+
+async def test_append_refreshes_every_session_key_to_one_ttl(
+    store_with_ttl: RedisStateStore,
+) -> None:
+    """BR-015 append atomically slides all branch/session keys together."""
+    await _seed_branched_session(store_with_ttl)
+    await _shorten_session_ttls(store_with_ttl)
+    await store_with_ttl.append("sync", ChatMessage(role="user", content="again"))
+    _assert_synchronized_ttls(await _session_pttls(store_with_ttl, "sync"))
+
+
+async def test_fork_refreshes_legacy_and_registry_keys_to_one_ttl(
+    store_with_ttl: RedisStateStore,
+) -> None:
+    """BR-015 forking a legacy session cannot create a longer-lived registry."""
+    key = "fifty_agent_sdk:state:legacy-sync"
+    await store_with_ttl._client.rpush(
+        key, ChatMessage(role="user", content="old").model_dump_json()
+    )
+    await store_with_ttl._client.pexpire(key, 10_000)
+    await store_with_ttl.fork("legacy-sync", from_sequence=1)
+    _assert_synchronized_ttls(await _session_pttls(store_with_ttl, "legacy-sync"))
+
+
+async def test_switch_refreshes_every_session_key_to_one_ttl(
+    store_with_ttl: RedisStateStore,
+) -> None:
+    """BR-015 switching cannot create an active pointer that outlives messages."""
+    branch = await _seed_branched_session(store_with_ttl)
+    await _shorten_session_ttls(store_with_ttl)
+    await store_with_ttl.switch_branch("sync", branch)
+    _assert_synchronized_ttls(await _session_pttls(store_with_ttl, "sync"))
+
+
+async def test_truncate_refreshes_every_session_key_to_one_ttl(
+    store_with_ttl: RedisStateStore,
+) -> None:
+    """BR-015 truncate uses the same whole-session sliding TTL transaction."""
+    await _seed_branched_session(store_with_ttl)
+    await _shorten_session_ttls(store_with_ttl)
+    await store_with_ttl.truncate_after("sync", 1)
+    _assert_synchronized_ttls(await _session_pttls(store_with_ttl, "sync"))
+
+
+async def test_ttl_disabled_mode_keeps_all_session_keys_durable(store: RedisStateStore) -> None:
+    """BR-015 ttl_seconds=None emits no expiry for any mutation-created key."""
+    branch = await _seed_branched_session(store)
+    await store.switch_branch("sync", branch)
+    await store.truncate_after("sync", 1)
+    assert set(await _session_pttls(store, "sync")) == {-1}
+
+
+async def test_mutation_retries_from_fresh_snapshot_after_watch_conflict(
+    store_with_ttl: RedisStateStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BR-015 a WatchError retries without duplicating the state mutation."""
+    original = store_with_ttl._mutation_snapshot
+    calls = 0
+
+    async def conflict_once(pipe: Any, session_id: str) -> Any:
+        nonlocal calls
+        calls += 1
+        snapshot = await original(pipe, session_id)
+        if calls == 1:
+            await store_with_ttl._client.hset(
+                store_with_ttl._branches_key(session_id),
+                "trunk",
+                json.dumps(
+                    {
+                        "parent_branch_id": None,
+                        "forked_from_sequence": None,
+                        "created_at": None,
+                    }
+                ),
+            )
+        return snapshot
+
+    monkeypatch.setattr(store_with_ttl, "_mutation_snapshot", conflict_once)
+    await store_with_ttl.append("retry", ChatMessage(role="user", content="once"))
+    assert calls == 2
+    assert [message.content for message in await store_with_ttl.get_messages("retry")] == ["once"]
+
+
+async def test_append_retries_and_reroutes_when_active_pointer_changes(
+    store_with_ttl: RedisStateStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BR-015 active-pointer conflicts retry before choosing the append target."""
+    await store_with_ttl.append("route", ChatMessage(role="user", content="trunk"))
+    branch = await store_with_ttl.fork("route", from_sequence=1)
+    original = store_with_ttl._mutation_snapshot
+    calls = 0
+
+    async def switch_during_first_snapshot(pipe: Any, session_id: str) -> Any:
+        nonlocal calls
+        calls += 1
+        snapshot = await original(pipe, session_id)
+        if calls == 1:
+            await store_with_ttl._client.set(store_with_ttl._active_key(session_id), branch)
+        return snapshot
+
+    monkeypatch.setattr(store_with_ttl, "_mutation_snapshot", switch_during_first_snapshot)
+    await store_with_ttl.append("route", ChatMessage(role="user", content="routed"))
+
+    assert calls == 2
+    trunk = await store_with_ttl.get_messages("route", branch_id="trunk")
+    fork = await store_with_ttl.get_messages("route", branch_id=branch)
+    assert [message.content for message in trunk] == ["trunk"]
+    assert [message.content for message in fork] == ["trunk", "routed"]
+
+
+async def test_append_retries_when_existing_fork_list_changes(
+    store_with_ttl: RedisStateStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BR-015 fork-list conflicts retry without lost, reordered, or duplicate writes."""
+    branch = await _seed_branched_session(store_with_ttl)
+    await _shorten_session_ttls(store_with_ttl)
+    original = store_with_ttl._mutation_snapshot
+    calls = 0
+
+    async def append_during_first_snapshot(pipe: Any, session_id: str) -> Any:
+        nonlocal calls
+        calls += 1
+        snapshot = await original(pipe, session_id)
+        if calls == 1:
+            await store_with_ttl._client.rpush(
+                store_with_ttl._msgs_key(session_id, branch),
+                ChatMessage(role="user", content="concurrent").model_dump_json(),
+            )
+        return snapshot
+
+    monkeypatch.setattr(store_with_ttl, "_mutation_snapshot", append_during_first_snapshot)
+    await store_with_ttl.append("sync", ChatMessage(role="user", content="requested"))
+
+    assert calls == 2
+    trunk = await store_with_ttl.get_messages("sync", branch_id="trunk")
+    fork = await store_with_ttl.get_messages("sync", branch_id=branch)
+    assert [message.content for message in trunk] == ["trunk"]
+    assert [message.content for message in fork] == [
+        "trunk",
+        "fork",
+        "concurrent",
+        "requested",
+    ]
+    _assert_synchronized_ttls(await _session_pttls(store_with_ttl, "sync"))
+
+
+async def test_mutation_wraps_watch_error_after_bounded_retries(
+    store_with_ttl: RedisStateStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BR-015 sustained optimistic-lock contention fails after three attempts."""
+    calls = 0
+
+    async def always_conflict(_pipe: Any, _session_id: str) -> Any:
+        nonlocal calls
+        calls += 1
+        raise WatchError("forced conflict")
+
+    monkeypatch.setattr(store_with_ttl, "_mutation_snapshot", always_conflict)
+    with pytest.raises(StateStoreError) as excinfo:
+        await store_with_ttl.append("retry", ChatMessage(role="user", content="never"))
+    assert calls == 3
+    assert excinfo.value.context["wrapped"] == "WatchError"
+
+
+def test_non_positive_ttl_seconds_rejected() -> None:
+    """``ttl_seconds <= 0`` raises at construction instead of deleting data.
+
+    Regression: the check was ``is not None``, so ``ttl_seconds=0`` issued
+    ``EXPIRE 0`` inside the append transaction — deleting every session key
+    on the first append.
+    """
+    for bad in (0, -1, -3600):
+        with pytest.raises(ValueError, match="positive integer or None"):
+            RedisStateStore("redis://localhost:6379/0", ttl_seconds=bad)
 
 
 # ---------------------------------------------------------------------------

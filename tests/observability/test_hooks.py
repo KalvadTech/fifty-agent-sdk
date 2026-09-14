@@ -186,7 +186,31 @@ async def test_invoke_hook_logs_invoke_failed_warning() -> None:
     assert failures[0]["log_level"] == "warning"
     assert failures[0]["hook_name"] == "on_tool_start"
     assert failures[0]["error_type"] == "RuntimeError"
-    assert failures[0]["error_message"] == "hook boom"
+    # Only the exception TYPE is logged — never str(exc) (see below).
+    assert "error_message" not in failures[0]
+
+
+async def test_invoke_hook_log_never_leaks_hook_arguments() -> None:
+    """A secret embedded in a hook's exception message never reaches the log.
+
+    Hooks receive high-value objects (``on_run_start`` gets the raw user
+    message, ``on_llm_call`` the full ``ChatRequest``, ``on_tool_start`` the
+    tool args), so a hook raising ``ValueError(f"unexpected: {args}")`` would
+    dump that content into a WARNING line if ``str(exc)`` were logged. The
+    failure log carries the exception TYPE only.
+    """
+    secret = "SECRET-hook-arg-DO-NOT-LEAK"
+
+    def hook(*args: object) -> None:
+        raise ValueError(f"unexpected: {args}")
+
+    with structlog.testing.capture_logs() as logs:
+        await invoke_hook(hook, "on_tool_start", "s1", "search", {"token": secret})
+
+    failures = [e for e in logs if e.get("event") == "hook.invoke_failed"]
+    assert len(failures) == 1
+    assert failures[0]["error_type"] == "ValueError"
+    assert secret not in str(failures[0])
 
 
 async def test_invoke_hook_reraises_cancelled_error() -> None:
